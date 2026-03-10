@@ -187,6 +187,43 @@ replace `score_rocket` stub with real KSP calls via the harness (this is a later
 
 ---
 
+## implementation plan — decisions locked in
+
+### fitness function
+use `delta_v` (computed by `compute_delta_v`) as the single continuous fitness score. rockets that fail structural validation or analytic filters score **0**. no partial credit for now.
+
+rationale: the cliff at 0 is acceptable because rejection sampling is fast and valid designs will appear in generation 0. partial credit adds complexity and signal dilution — revisit only if the GA fails to bootstrap (i.e. generation 0 has zero valid designs).
+
+```
+fitness(rocket):
+    if not validate_rocket(rocket):   → 0
+    if not filter_rocket(rocket):     → 0
+    else:                             → compute_delta_v(rocket)
+```
+
+### selection
+use **tournament selection**, not fitness-proportionate (roulette wheel). reasons:
+- FPS needs a wide continuous fitness distribution to work; early populations will have many 0s and a handful of real scores — FPS degenerates in this regime
+- FPS causes premature convergence if one design dominates early
+- tournament is simpler, robust, and preserves diversity
+
+### generation 0 (initialization)
+random generator with rejection sampling: generate a random rocket, validate + filter, keep if it passes, discard and retry if not. filters are cheap so this is fine.
+
+### crossover
+stage-level crossover — take upper stage(s) from parent A, lower stage(s) from parent B. invalid offspring are discarded (free to do because validation is instantaneous).
+
+### build order
+1. random rocket generator (`generate_random_rocket`)
+2. fitness function stub (`score_rocket` — calls filters, returns delta-v or 0)
+3. tournament selection (`tournament_select`)
+4. mutation operators (`mutate`)
+5. stage crossover (`crossover`)
+6. main GA loop
+7. KSP harness integration (later — replaces fitness stub with real simulation)
+
+---
+
 ## connection to the rest of the pipeline
 
 ```
