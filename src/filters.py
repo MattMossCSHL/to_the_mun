@@ -65,6 +65,7 @@ def compute_delta_v(rocket_dict: dict,
                     parts_dict: dict,
                     resource_lookup: dict,
                     g_const: float = 9.80665,
+                    return_breakdown = False,
                     verbose: bool = False):
     """
     Return total delta-v in m/s using the Tsiolkovsky rocket equation, summed across all stages.
@@ -73,17 +74,20 @@ def compute_delta_v(rocket_dict: dict,
     For each stage: fuel mass is computed by walking the part tree from the engine toward the root,
     accumulating propellant mass until a Decoupler is encountered. After each stage, jettisoned
     parts (decoupler + all descendants) are subtracted from the running wet mass.
+
+    If return_breakdown=True, returns a dict of {stage_num: dv} instead of the total float.
     """
 
     m_wet = get_total_mass(parts_list, parts_dict, resource_lookup)
     total_dv = 0
-
+    stage_dvs = {}
     # parts lookup by id
     id_to_type = {p['id']: p['type'] for p in rocket_dict['parts']}
     #parent lookup by id for trace
     id_to_parent = {p['id']: p['parent'] for p in rocket_dict['parts']}
     #child lookup by id for reverse order trace
     id_to_children = {}
+
     for part in rocket_dict['parts']:
         if part['parent'] is not None:
             if part['parent'] not in id_to_children:
@@ -129,6 +133,7 @@ def compute_delta_v(rocket_dict: dict,
         isp = parts_dict[engine_type]['engine']['isp']['vacuum']
         m_dry = m_wet - fuel_mass
         dv = isp * g_const * math.log(m_wet / m_dry)
+        stage_dvs[stage_num] = dv
         total_dv += dv
         if verbose:
             print(f"stage {stage_num}: isp={isp}, m_wet={m_wet:.3f}, m_dry={m_dry:.3f}, dv={dv:.1f}")
@@ -147,7 +152,8 @@ def compute_delta_v(rocket_dict: dict,
                 print(f"  jettisoned {jettisoned}, dry mass={jettisoned_mass:.3f}t, new m_wet={m_wet:.3f}")
         else:
             m_wet = m_dry
-
+    if return_breakdown:
+        return stage_dvs
     return total_dv
 
 

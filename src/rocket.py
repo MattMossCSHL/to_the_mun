@@ -20,6 +20,11 @@ Intended usage:
     r.set_stage("eng_0", 0)
 
     r.validate(verbose=True)
+
+TODO: add a from_dict(rocket_dict, parts_by_name) classmethod so GA mutation
+functions can reconstruct a Rocket object from a dict, use add_part/set_stage,
+and convert back with to_dict(). Currently mutation functions manipulate the
+dict directly as a workaround.
 """
 
 from src.structure import check_part_call, validate_rocket
