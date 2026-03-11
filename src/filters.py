@@ -132,6 +132,8 @@ def compute_delta_v(rocket_dict: dict,
         engine_type = id_to_type[engine_id]
         isp = parts_dict[engine_type]['engine']['isp']['vacuum']
         m_dry = m_wet - fuel_mass
+        if m_dry <=0:
+            break ### adding this because mutation can make fuel mass > total mass (random mutational process, it's weird)
         dv = isp * g_const * math.log(m_wet / m_dry)
         stage_dvs[stage_num] = dv
         total_dv += dv

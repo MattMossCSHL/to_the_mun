@@ -6,13 +6,20 @@ Functions
 generate_random_rocket  : build a random rocket dict (no validation)
 score_rocket            : fitness function — returns delta-v or 0
 evaluate_population     : generate and score n rockets, returns list of (rocket, meta) tuples
+score_population        : score an existing list of rocket dicts, returns (rocket, meta) tuples
 tournament_select       : select survivors via tournament selection
 mutate_swap_part        : replace a random non-pod part with another of the same type
 mutate_add_stage        : append a new decoupler+tank+engine stage to the bottom
 mutate_remove_stage     : drop the bottom stage entirely
+mutate                  : apply one random mutation operator to a rocket
+crossover               : stage-level crossover between two parent rockets
+save_generation         : write a population to a JSON file
+run_ga                  : main GA loop
 """
 
 import copy
+import json
+import os
 import random
 
 from src.rocket import Rocket
@@ -360,3 +367,302 @@ def mutate_remove_stage(rocket_dict: dict):
         new_rocket['stages'].pop(pid, None)
 
     return new_rocket
+
+
+def mutate(rocket_dict: dict,
+           pods: list,
+           tanks: list,
+           engines: list,
+           decouplers: list,
+           max_stages: int = 4):
+    """Apply one randomly chosen mutation operator to a rocket.
+
+    Randomly selects between swap_part, add_stage, and remove_stage.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket dict with 'parts' and 'stages' fields.
+    pods : list
+        Part names with category 'Pods'.
+    tanks : list
+        Part names with resources and no engine.
+    engines : list
+        Part names with an engine field.
+    decouplers : list
+        Part names starting with 'Decoupler_'.
+    max_stages : int, optional
+        Maximum number of stages, passed to mutate_add_stage. Default 4.
+
+    Returns
+    -------
+    dict
+        New mutated rocket dict.
+    """
+    choices = ['swap', 'add', 'remove']
+    mutation = random.choice(choices)
+
+    if mutation == 'swap':
+        return mutate_swap_part(rocket_dict, pods, tanks, engines, decouplers)
+    if mutation == 'add':
+        return mutate_add_stage(rocket_dict, tanks, engines, decouplers, max_stages=max_stages)
+    if mutation == 'remove':
+        return mutate_remove_stage(rocket_dict)
+
+
+def crossover(parent_a: tuple,
+              parent_b: tuple):
+    """Stage-level crossover between two parent rockets.
+
+    Takes upper stages from parent A (up to a random cut point) and grafts
+    the booster stages from parent B onto the bottom. Returns parent A unchanged
+    if parent B is single-stage (nothing to graft).
+
+    Parameters
+    ----------
+    parent_a : tuple
+        (rocket_dict, meta) tuple.
+    parent_b : tuple
+        (rocket_dict, meta) tuple.
+
+    Returns
+    -------
+    tuple
+        (child_rocket_dict, {'score': 0}) — score is unknown until evaluated.
+    """
+    parent_a_dict, _ = parent_a
+    parent_b_dict, _ = parent_b
+
+    parent_a_copy = copy.deepcopy(parent_a_dict)
+    parent_b_copy = copy.deepcopy(parent_b_dict)
+
+    max_stage_a = max(parent_a_copy['stages'].values())
+    a_cut = random.randint(0, max_stage_a)
+
+    if max(parent_b_copy['stages'].values()) == 0:
+        return (parent_a_copy, {'score': 0})
+
+    child = copy.deepcopy(parent_a_copy)
+    while max(child['stages'].values()) > a_cut:
+        child = mutate_remove_stage(child)
+
+    all_ids_child = {p['id'] for p in child['parts']}
+    parent_ids_child = {p['parent'] for p in child['parts'] if p['parent'] is not None}
+    bottom_id_child = (all_ids_child - parent_ids_child).pop()
+
+    id_to_parent_b = {p['id']: p['parent'] for p in parent_b_copy['parts']}
+    b_parts_by_id = {p['id']: p for p in parent_b_copy['parts']}
+
+    all_ids_b = {p['id'] for p in parent_b_copy['parts']}
+    parent_ids_b = {p['parent'] for p in parent_b_copy['parts'] if p['parent'] is not None}
+    bottom_id_b = (all_ids_b - parent_ids_b).pop()
+
+    stage_0_ids = {pid for pid, s in parent_b_copy['stages'].items() if s == 0}
+
+    current = bottom_id_b
+    graft_ids = []
+    while True:
+        graft_ids.append(current)
+        parent = id_to_parent_b[current]
+        if parent in stage_0_ids:
+            break
+        current = parent
+
+    graft_ids = graft_ids[::-1]
+
+    n_decouplers = sum(1 for p in child['parts'] if p['id'].startswith('decoupler_'))
+    n_tanks = sum(1 for p in child['parts'] if p['id'].startswith('tank_'))
+    n_engines = sum(1 for p in child['parts'] if p['id'].startswith('eng_'))
+
+    id_map = {}
+    for old_id in graft_ids:
+        if old_id.startswith('decoupler_'):
+            id_map[old_id] = f"decoupler_{n_decouplers}"
+            n_decouplers += 1
+        elif old_id.startswith('tank_'):
+            id_map[old_id] = f"tank_{n_tanks}"
+            n_tanks += 1
+        elif old_id.startswith('eng_'):
+            id_map[old_id] = f"eng_{n_engines}"
+            n_engines += 1
+
+    for i, old_id in enumerate(graft_ids):
+        part = copy.deepcopy(b_parts_by_id[old_id])
+        part['id'] = id_map[old_id]
+        if i == 0:
+            part['parent'] = bottom_id_child
+        else:
+            part['parent'] = id_map[graft_ids[i - 1]]
+        child['parts'].append(part)
+
+    for old_id in graft_ids:
+        if old_id in parent_b_copy['stages']:
+            old_stage = parent_b_copy['stages'][old_id]
+            child['stages'][id_map[old_id]] = old_stage + a_cut
+
+    return (child, {'score': 0})
+
+
+def score_population(rockets: list,
+                     parts_by_name: dict,
+                     resource_lookup: dict,
+                     generation: int = 0,
+                     detailed: bool = False):
+    """Score an existing list of rocket dicts.
+
+    Same scoring logic as evaluate_population but without random generation.
+    Use this to score children produced by crossover and mutation.
+
+    Parameters
+    ----------
+    rockets : list
+        List of rocket dicts.
+    parts_by_name : dict
+        Full parts library keyed by part name.
+    resource_lookup : dict
+        Resource densities as returned by load_resource_lookup().
+    generation : int, optional
+        Generation number, stored in detailed metadata.
+    detailed : bool, optional
+        If True, include full metadata breakdown in each tuple.
+
+    Returns
+    -------
+    list
+        List of (rocket_dict, meta) tuples.
+    """
+    population = []
+    for rocket in rockets:
+        valid = validate_rocket(rocket, parts_by_name)
+        parts_list = [p['type'] for p in rocket['parts']]
+        filtered, reasons = filter_rocket(rocket, parts_list, parts_by_name, resource_lookup, DV_THRESHOLDS)
+
+        if valid and filtered:
+            stage_dvs = compute_delta_v(rocket, parts_list, parts_by_name, resource_lookup, return_breakdown=True)
+            score = sum(stage_dvs.values())
+        else:
+            score = 0
+            stage_dvs = {}
+
+        if not detailed:
+            meta = {'score': score}
+        else:
+            meta = {'score': score,
+                    'valid': valid,
+                    'filtered': filtered,
+                    'n_stages': len(set(rocket['stages'].values())),
+                    'n_parts': len(parts_list),
+                    'stage_dv': stage_dvs,
+                    'generation': generation
+                    }
+        population.append((rocket, meta))
+    return population
+
+
+def save_generation(population: list,
+                    generation: int,
+                    run_dir: str):
+    """Write a population to a JSON file in run_dir.
+
+    Creates run_dir if it does not exist. Output filename is gen_NNN.json.
+
+    Parameters
+    ----------
+    population : list
+        List of (rocket_dict, meta) tuples.
+    generation : int
+        Generation number, used in filename and stored in output.
+    run_dir : str
+        Directory to write the file into.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    records = [{'rocket': rocket, 'meta': meta} for rocket, meta in population]
+    filename = os.path.join(run_dir, f"gen_{generation:03d}.json")
+    with open(filename, 'w') as f:
+        json.dump({'generation': generation, 'rockets': records}, f, indent=2)
+    print(f"saved {len(population)} rockets to {filename}")
+
+
+def run_ga(n_rockets: int,
+           n_generations: int,
+           parts_by_name: dict,
+           resource_lookup: dict,
+           pods: list,
+           tanks: list,
+           engines: list,
+           decouplers: list,
+           max_stages: int = 2,
+           n_elites: int = 5,
+           mutation_rate: float = 0.3,
+           detailed: bool = False,
+           save_dir: str = None):
+    """Run the genetic algorithm and return the final population.
+
+    Initialises with a random population, then iterates: tournament selection,
+    crossover, optional mutation, re-scoring. Top n_elites survivors carry
+    forward unchanged each generation to prevent regression.
+
+    Parameters
+    ----------
+    n_rockets : int
+        Population size per generation.
+    n_generations : int
+        Number of generations to run.
+    parts_by_name : dict
+        Full parts library keyed by part name.
+    resource_lookup : dict
+        Resource densities as returned by load_resource_lookup().
+    pods : list
+        Part names with category 'Pods'.
+    tanks : list
+        Part names with resources and no engine.
+    engines : list
+        Part names with an engine field.
+    decouplers : list
+        Part names starting with 'Decoupler_'.
+    max_stages : int, optional
+        Maximum stages per rocket. Default 2.
+    n_elites : int, optional
+        Number of top survivors carried forward unchanged each generation. Default 5.
+    mutation_rate : float, optional
+        Probability of mutating each child. Default 0.3.
+    detailed : bool, optional
+        If True, store full metadata in each tuple.
+    save_dir : str, optional
+        If provided, save each generation to this directory as gen_NNN.json.
+
+    Returns
+    -------
+    list
+        Final population as list of (rocket_dict, meta) tuples.
+    """
+    population = evaluate_population(n_rockets, parts_by_name, resource_lookup,
+                                     pods, tanks, engines, decouplers,
+                                     max_stages=max_stages, generation=0, detailed=detailed)
+
+    if save_dir:
+        save_generation(population, 0, save_dir)
+
+    for gen in range(n_generations):
+        children = []
+        survivors = tournament_select(population)
+        elites = sorted(survivors, key=lambda x: x[1]['score'], reverse=True)[:n_elites]
+
+        while len(children) < n_rockets - n_elites:
+            parent_a = random.choice(survivors)
+            parent_b = random.choice(survivors)
+            child, _ = crossover(parent_a, parent_b)
+            if random.random() < mutation_rate:
+                child = mutate(child, pods=pods, tanks=tanks, engines=engines,
+                               decouplers=decouplers, max_stages=max_stages)
+            children.append(child)
+
+        population = score_population(rockets=children, parts_by_name=parts_by_name,
+                                      resource_lookup=resource_lookup,
+                                      detailed=detailed, generation=gen + 1)
+        population.extend(elites)
+
+        if save_dir:
+            save_generation(population, gen + 1, save_dir)
+
+    return population
