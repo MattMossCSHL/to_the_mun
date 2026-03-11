@@ -1,0 +1,8 @@
+{
+  "parts": [
+    {"id": "pod_0",  "type": "mk1-3pod",      "parent": null},
+    {"id": "tank_0", "type": "fuelTank",       "parent": "pod_0",  "attach_node": "bottom"},
+    {"id": "eng_0",  "type": "liquidEngine",   "parent": "tank_0", "attach_node": "bottom"}
+  ],
+  "stages": {"eng_0": 0}
+}

@@ -123,6 +123,31 @@ after multi-stage is working, allow parts to attach to non-bottom nodes (side-mo
 
 ---
 
+## air-breathing engines — atmospheric delta-v model
+
+**status: planned, not yet implemented — next feature in `analytic_filters.ipynb`**
+
+### the problem
+
+jet engines (e.g. `turboFanSize2`) have very high Isp in the KSP parts data but only produce thrust in the lower atmosphere. they flame out at ~25-30 km. the current `compute_delta_v` formula uses stated Isp as if it applies the entire flight, so a jet-only rocket can score 40,000+ m/s in the GA while being physically incapable of reaching 70 km apoapsis. discovered via `analyze_population` — top 10 rockets were all identical turbofan designs.
+
+### rejected approach — hard filter
+
+blacklisting jet engines from `load_part_lists` was considered but rejected. jet engines are a legitimate KSP design strategy in lower stages of multi-stage rockets. removing them throws away real design space. the oracle (KSP simulation) would naturally penalize designs that can't reach orbit, but the oracle is far away and in the meantime the GA converges on useless designs.
+
+### chosen approach — atmospheric delta-v model
+
+detect air-breathing engines (propellant type `IntakeAir` in the parts data) and model their delta-v contribution differently:
+- jet stages contribute delta-v only up to their operational ceiling (~25 km)
+- rocket stages contribute from that ceiling onward
+- total score = jet contribution + rocket contribution
+
+this keeps jet engines as valid parts, gives them credit for what they actually do, and prevents them from gaming the score.
+
+implementation: new cell in `analytic_filters.ipynb`, extracted to `src/filters.py` when done.
+
+---
+
 ## `Rocket.from_dict()` — deferred
 
 **status: deferred**

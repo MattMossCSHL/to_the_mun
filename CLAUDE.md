@@ -30,15 +30,17 @@ read `ksp_project_agent_brief.md` for full context. read the latest file in `llm
 ## project architecture (pipeline)
 
 ```
-design generator
+design generator          ← DONE (GA complete)
     ↓
-structure validator       ← Goal 0 (DONE)
+structure validator       ← DONE (Goal 0)
     ↓
-analytic filters          ← Goal 1+
+analytic filters          ← DONE (TWR, delta-v, burn time)
     ↓
-surrogate simulator       ← Goal 1+
+CoM/CoL stability filter  ← deferred (needed before KSP harness is useful)
     ↓
-top candidates → ksp harness
+surrogate simulator       ← not started
+    ↓
+top candidates → ksp harness   ← not started (kRPC research upcoming)
     ↓
 dataset → model training
 ```
@@ -53,6 +55,13 @@ KSP is slow. treat it as the expensive ground-truth oracle, not the primary trai
 - **Goal 3** — reach Mun orbit
 - **Goal 4** — land on Mun
 
+## deferred milestones
+
+- **CoM/CoL stability** — KSP checks center of mass vs center of lift. An aerodynamically unstable rocket will flip. Requires placing parts in 3D space (attachment offsets along vertical axis). Natural prerequisite for `to_craft()` since craft files encode part positions. Will become a cheap analytic filter sitting between the current filters and the KSP oracle.
+- **Morphological freedom** — radial attachment, fairings, nose cones, fins. Deferred until linear stack GA is mature.
+- **Progressive complexity** — increase `max_stages` after average dv threshold met. Planned, not yet implemented.
+- **`Rocket.from_dict()`** — classmethod on `Rocket`. Needed before `to_craft()`. Note in `src/rocket.py`.
+
 ---
 
 ## key files and data
@@ -63,13 +72,23 @@ KSP is slow. treat it as the expensive ground-truth oracle, not the primary trai
 | `data/toy_rocket.json` | minimal 3-part test rocket |
 | `src/scraper.py` | KSP .cfg parser and part extractor |
 | `src/structure.py` | all structural validity checks + `validate_rocket` |
+| `src/filters.py` | TWR, delta-v, burn-time filters + `compute_delta_v` (return_breakdown flag) |
+| `src/genetic_algorithm.py` | full GA: generate, score, evaluate, select, mutate, crossover, run_ga |
+| `src/plots.py` | `plot_run` — visualise GA run with outlier clipping |
+| `src/config.py` | `load_part_lists` → `(pods, tanks, engines, decouplers)` |
+| `src/rocket.py` | `Rocket` class — TODO: add `from_dict()` classmethod |
 | `scripts/scrape_ksp_parts.py` | CLI to regenerate parts library from KSP install |
 | `scripts/check_rocket_structure.py` | CLI to validate a rocket JSON |
+| `scripts/run_ga.py` | CLI to run the GA |
+| `scripts/plot_run.py` | CLI to plot a saved GA run |
 | `notebooks/building_the_parser.ipynb` | parser walkthrough (complete) |
 | `notebooks/structural_validator.ipynb` | validator walkthrough (complete) |
+| `notebooks/analytic_filters.ipynb` | filters walkthrough (complete) |
+| `notebooks/design_generator.ipynb` | GA walkthrough (complete) |
 | `ksp_project_agent_brief.md` | full project brief |
 | `llm_docs/sessions/` | per-session progress logs |
 | `llm_docs/handoffs/` | end-of-session handoff documents |
+| `llm_docs/design_decisions.md` | running log of major design decisions |
 
 ## rocket dict format
 
@@ -92,9 +111,11 @@ KSP is slow. treat it as the expensive ground-truth oracle, not the primary trai
 
 ## current status
 
-Goal 0 is complete. the structural validator is fully implemented and tested.
-The `Rocket` class is complete (`src/rocket.py`, `notebooks/rocket_representation.ipynb`).
+Goals 0 and 1 analytic filters are complete. The GA (`src/genetic_algorithm.py`) is fully built, tested, and extracted. `notebooks/design_generator.ipynb` is the complete walkthrough.
 
-**next task**: `notebooks/analytic_filters.ipynb`
-
-build three analytic filters — TWR, delta-v, burn time — that cheaply screen rocket designs before KSP simulation. resource densities are scraped from `ResourcesGeneric.cfg` via `parse_cfg`. all filter functions take `(rocket_dict, parts_by_name, resource_lookup)`. extract to `src/filters.py` when done.
+**upcoming work (in rough order):**
+1. Atmospheric delta-v model — detect air-breathing engines, cap their contribution at operational ceiling (~25 km). New cell in `analytic_filters.ipynb`, extract to `src/filters.py`. See `llm_docs/design_decisions.md` for full rationale.
+2. `to_craft()` — convert rocket dict to KSP `.craft` file format. Requires researching minimal `.craft` structure and placing parts in 3D space along vertical axis. Unlocks CoM/CoL filter.
+3. `Rocket.from_dict()` classmethod in `src/rocket.py`
+4. Progressive complexity — grow `max_stages` when top-K average dv crosses a threshold. See `design_decisions.md`.
+5. kRPC research — understand how to automate KSP staging/steering for the simulation oracle
