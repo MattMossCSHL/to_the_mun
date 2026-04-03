@@ -3,7 +3,7 @@ plots.py — visualisation utilities for GA run output.
 
 Functions
 ---------
-plot_run : scatter plot of delta-v by generation with mean line and per-gen stats
+plot_run : scatter plot of delta-v by generation with median non-zero line and per-gen stats
 """
 
 import glob
@@ -18,9 +18,9 @@ def plot_run(run_dir: str):
     """Plot delta-v by generation for a saved GA run.
 
     Reads all gen_NNN.json files from run_dir. Scatter plots every rocket's
-    score per generation, overlays a mean delta-v line, clips the y-axis at
+    score per generation, overlays a median non-zero delta-v line, clips the y-axis at
     the 99th percentile, and marks outliers with orange triangles.
-    Per-generation stats (mean, zeros, invalid) are annotated above the plot.
+    Per-generation stats (median non-zero, zeros, invalid) are annotated above the plot.
 
     Parameters
     ----------
@@ -34,7 +34,8 @@ def plot_run(run_dir: str):
 
     generations = []
     all_scores = []
-    means = []
+    median_nonzeros = []
+    max_scores = []
     n_zeros = []
     n_invalid = []
 
@@ -47,7 +48,9 @@ def plot_run(run_dir: str):
 
         generations.append(gen)
         all_scores.append(scores)
-        means.append(sum(scores) / len(scores))
+        nonzero_scores = [s for s in scores if s > 0]
+        median_nonzeros.append(np.median(nonzero_scores) if nonzero_scores else 0)
+        max_scores.append(max(scores) if scores else 0)
         n_zeros.append(sum(1 for s in scores if s == 0))
         n_invalid.append(len(invalids))
 
@@ -65,11 +68,11 @@ def plot_run(run_dir: str):
                        marker='^', color='orange', s=30, zorder=5,
                        label='outlier (clipped)' if gen == generations[0] else '')
 
-    ax.plot(generations, means, color='tomato', linewidth=2, label='mean delta-v')
+    ax.plot(generations, median_nonzeros, color='tomato', linewidth=2, label='median non-zero delta-v')
     ax.set_ylim(0, y_cap * 1.15)
 
-    for gen, mean, nz, ni in zip(generations, means, n_zeros, n_invalid):
-        ax.text(gen, y_cap * 1.08, f"mean:{mean:.0f}\nzeros:{nz}\ninvalid:{ni}",
+    for gen, median_nz, max_score, nz, ni in zip(generations, median_nonzeros, max_scores, n_zeros, n_invalid):
+        ax.text(gen, y_cap * 1.08, f"median nz:{median_nz:.0f}\nmax:{max_score:.0f}\nzeros:{nz}\ninvalid:{ni}",
                 ha='center', va='top', fontsize=7, color='dimgray')
 
     ax.set_xlabel('generation')

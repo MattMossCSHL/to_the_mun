@@ -85,16 +85,28 @@ def load_part_lists(parts_by_name):
     tuple
         (pods, tanks, engines, decouplers) — each a list of part name strings.
     """
+    stack_unsafe_tokens = ("mk2", "mk3")
+    tank_propellants = {"LiquidFuel", "Oxidizer", "SolidFuel", "XenonGas"}
+
+    def is_stack_safe(name):
+        lowered = name.lower()
+        return not any(token in lowered for token in stack_unsafe_tokens)
+
     pods = []
     tanks = []
     engines = []
     decouplers = []
     for name, part in parts_by_name.items():
-        if part["category"] == "Pods":
+        resources = set((part["resources"] or {}).keys())
+
+        if not is_stack_safe(name):
+            continue
+
+        if part["category"] == "Pods" or str(part.get("_source_file", "")).startswith("Command/"):
             pods.append(name)
         elif part["engine"] is not None:
             engines.append(name)
-        elif part["resources"] is not None:
+        elif resources & tank_propellants:
             tanks.append(name)
         elif name.startswith("Decoupler_"):
             decouplers.append(name)
