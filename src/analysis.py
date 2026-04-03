@@ -5,10 +5,13 @@ Functions
 ---------
 analyze_population : summarise top-N vs full population by score, stage count,
                      part count, and part-type frequency.
+inspect_top_rockets : print top-N rocket compositions from a saved generation file.
 """
 
+import json
 import statistics
 from collections import Counter
+from pathlib import Path
 
 
 def _extract_features(individual):
@@ -216,3 +219,50 @@ def analyze_population(population, top_n=10, verbose=False):
         'full': pop_stats,
         'summary': summary,
     }
+
+
+def inspect_top_rockets(run_dir, generation=None, top_n=5):
+    """Print top-N rocket compositions from a saved GA run generation file.
+
+    Parameters
+    ----------
+    run_dir : str or Path
+        Directory containing gen_NNN.json files.
+    generation : int, optional
+        Specific generation number to inspect. If None, uses the latest file.
+    top_n : int, optional
+        Number of top-scoring rockets to print. Default 5.
+    """
+    run_dir = Path(run_dir)
+    gen_files = sorted(run_dir.glob('gen_*.json'))
+    if not gen_files:
+        print('no generation files found')
+        return
+
+    target = gen_files[-1] if generation is None else run_dir / f'gen_{generation:03d}.json'
+    data = json.loads(target.read_text())
+    rockets = sorted(data['rockets'], key=lambda r: r['meta']['score'], reverse=True)
+
+    print(f'file: {target}')
+    print(f'generation: {data["generation"]}')
+    print()
+
+    for i, rec in enumerate(rockets[:top_n], start=1):
+        rocket = rec['rocket']
+        meta = rec['meta']
+
+        engines = [p['type'] for p in rocket['parts'] if p['id'].startswith('eng_')]
+        tanks = [p['type'] for p in rocket['parts'] if p['id'].startswith('tank_')]
+
+        print(f'=== TOP {i} ===')
+        print(f'score:    {meta["score"]:.1f}')
+        print(f'engines:  {engines}')
+        print(f'tanks:    {tanks}')
+        print(f'stages:   {sorted(set(rocket["stages"].values()))}')
+        print(f'stage_dv: {meta.get("stage_dv")}')
+        print('parts:')
+        for part in rocket['parts']:
+            stage = rocket['stages'].get(part['id'])
+            parent = str(part['parent'])
+            print(f'  {part["id"]:12s} {part["type"]:20s} parent={parent:12s} stage={stage}')
+        print()

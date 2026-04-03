@@ -411,12 +411,14 @@ def mutate(rocket_dict: dict,
 
 
 def crossover(parent_a: tuple,
-              parent_b: tuple):
+              parent_b: tuple,
+              max_stages: int = 2):
     """Stage-level crossover between two parent rockets.
 
     Takes upper stages from parent A (up to a random cut point) and grafts
-    the booster stages from parent B onto the bottom. Returns parent A unchanged
-    if parent B is single-stage (nothing to graft).
+    the booster stages from parent B onto the bottom. If the graft would exceed
+    max_stages, trims bottom stages until the child fits the cap. Returns
+    parent A unchanged if parent B is single-stage (nothing to graft).
 
     Parameters
     ----------
@@ -424,6 +426,8 @@ def crossover(parent_a: tuple,
         (rocket_dict, meta) tuple.
     parent_b : tuple
         (rocket_dict, meta) tuple.
+    max_stages : int, optional
+        Maximum number of stages allowed in the child. Default 2.
 
     Returns
     -------
@@ -499,6 +503,10 @@ def crossover(parent_a: tuple,
         if old_id in parent_b_copy['stages']:
             old_stage = parent_b_copy['stages'][old_id]
             child['stages'][id_map[old_id]] = old_stage + a_cut
+
+    ### enforce the GA max stages in this function so we dont get massive rockets that game the dv calculation
+    while len(set(child['stages'].values())) > max_stages:
+        child = mutate_remove_stage(child)
 
     return (child, {'score': 0})
 
@@ -651,7 +659,7 @@ def run_ga(n_rockets: int,
         while len(children) < n_rockets - n_elites:
             parent_a = random.choice(survivors)
             parent_b = random.choice(survivors)
-            child, _ = crossover(parent_a, parent_b)
+            child, _ = crossover(parent_a, parent_b, max_stages=max_stages)
             if random.random() < mutation_rate:
                 child = mutate(child, pods=pods, tanks=tanks, engines=engines,
                                decouplers=decouplers, max_stages=max_stages)
