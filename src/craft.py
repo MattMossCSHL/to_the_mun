@@ -10,6 +10,13 @@ from pathlib import Path
 import random
 import re
 
+from src.scraper import clean_value, parse_cfg
+
+
+DEFAULT_KSP_ROOT = Path(
+    "/Users/moss/Library/Application Support/Steam/steamapps/common/Kerbal Space Program"
+)
+
 
 def make_ksp_part_ids(rocket_dict, craft_part_names, seed=12345):
     rng = random.Random(seed)
@@ -28,6 +35,24 @@ def build_children_lookup(rocket_dict):
         if parent is not None:
             children[parent].append(part['id'])
     return children
+
+
+def choose_child_attach_node(part_type, parts_by_name):
+    """Choose the child-side node used to attach into a linear stack."""
+    nodes = parts_by_name[part_type]['nodes']
+    for candidate in ('top', 'bottom', 'attach'):
+        if candidate in nodes:
+            return candidate
+    raise ValueError(f'part {part_type} has no usable attach node for linear stack placement')
+
+
+def choose_parent_attach_node(part_type, requested_node, parts_by_name):
+    """Choose the parent-side node used to attach a child in a linear stack."""
+    nodes = parts_by_name[part_type]['nodes']
+    for candidate in (requested_node, 'bottom', 'top', 'attach'):
+        if candidate in nodes:
+            return candidate
+    raise ValueError(f'part {part_type} has no usable parent attach node for linear stack placement')
 
 
 def linear_stack_positions(rocket_dict, parts_by_name, root_pos=(0.0, 15.0, 0.0)):
@@ -49,8 +74,12 @@ def linear_stack_positions(rocket_dict, parts_by_name, root_pos=(0.0, 15.0, 0.0)
         parent_part = next(part for part in rocket_dict['parts'] if part['id'] == current)
         child_part = next(part for part in rocket_dict['parts'] if part['id'] == child)
 
-        parent_attach_name = child_part.get('attach_node', 'bottom') or 'bottom'
-        child_attach_name = 'top'
+        parent_attach_name = choose_parent_attach_node(
+            parent_part['type'],
+            child_part.get('attach_node', 'bottom') or 'bottom',
+            parts_by_name,
+        )
+        child_attach_name = choose_child_attach_node(child_part['type'], parts_by_name)
 
         parent_attach = parts_by_name[parent_part['type']]['nodes'][parent_attach_name]['pos']
         child_attach = parts_by_name[child_part['type']]['nodes'][child_attach_name]['pos']
@@ -100,6 +129,10 @@ def craft_name_aliases(part_name):
     dotted_suffix = re.sub(r'_(\d+)$', r'.\1', part_name)
     if dotted_suffix not in aliases:
         aliases.append(dotted_suffix)
+
+    dotted_upper_suffix = re.sub(r'_([A-Z][A-Z0-9]*)$', r'.\1', part_name)
+    if dotted_upper_suffix not in aliases:
+        aliases.append(dotted_upper_suffix)
 
     return aliases
 
@@ -231,6 +264,20 @@ def parse_part_template_block(block_text):
     return {'fields': fields, 'nested_blocks': nested_blocks}
 
 
+def sanitize_nested_blocks(nested_blocks):
+    """Drop template-carried blocks that should not leak vessel-specific state."""
+    sanitized = []
+    for block in nested_blocks:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        block_name = lines[0].strip()
+        if block_name == 'VESSELNAMING':
+            continue
+        sanitized.append(block)
+    return sanitized
+
+
 def render_part_template_struct(part_struct):
     lines = ['PART', '{']
     for key, value in part_struct['fields']:
@@ -303,51 +350,71 @@ def render_resource_block(name, amount):
     ])
 
 
-def render_generic_engine_module():
-    return '\n'.join([
-        '\tMODULE',
-        '\t{',
-        '\t\tname = ModuleEnginesFX',
-        '\t\tisEnabled = True',
-        '\t\tstaged = False',
-        '\t\tflameout = False',
-        '\t\tEngineIgnited = False',
-        '\t\tengineShutdown = False',
-        '\t\tcurrentThrottle = 0',
-        '\t\tthrustPercentage = 100',
-        '\t\tmanuallyOverridden = False',
-        '\t\tincludeinDVCalcs = False',
-        '\t\tstagingEnabled = True',
-        '\t\tEVENTS',
-        '\t\t{',
-        '\t\t}',
-        '\t\tACTIONS',
-        '\t\t{',
-        '\t\t\tOnAction',
-        '\t\t\t{',
-        '\t\t\t\tactionGroup = None',
-        '\t\t\t\twasActiveBeforePartWasAdjusted = False',
-        '\t\t\t}',
-        '\t\t\tShutdownAction',
-        '\t\t\t{',
-        '\t\t\t\tactionGroup = None',
-        '\t\t\t\twasActiveBeforePartWasAdjusted = False',
-        '\t\t\t}',
-        '\t\t\tActivateAction',
-        '\t\t\t{',
-        '\t\t\t\tactionGroup = None',
-        '\t\t\t\twasActiveBeforePartWasAdjusted = False',
-        '\t\t\t}',
-        '\t\t}',
-        '\t\tUPGRADESAPPLIED',
-        '\t\t{',
-        '\t\t}',
-        '\t}',
-    ])
+def resolve_part_cfg_path(part_data, search_root=DEFAULT_KSP_ROOT):
+    """Resolve the stock cfg path for a scraped part record."""
+    source_file = part_data.get('_source_file')
+    if not source_file:
+        return None
+
+    search_root = Path(search_root)
+    candidate_paths = [
+        search_root / 'GameData' / 'Squad' / 'Parts' / source_file,
+        search_root / source_file,
+    ]
+
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate
+    return None
 
 
-def make_generic_part_struct(part, rocket_dict, parts_by_name, ksp_id_map, positions):
-    """Build a generic PART structure when no stock template is available."""
+def render_cfg_block(block, indent_level=1):
+    """Render a parsed cfg block as craft text with cleaned values."""
+    indent = '\t' * indent_level
+    child_indent = '\t' * (indent_level + 1)
+    lines = [f'{indent}{block["_type"]}', f'{indent}{{']
+
+    for key, value in block.items():
+        if key.startswith('_'):
+            continue
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            lines.append(f'{child_indent}{key} = {clean_value(item)}')
+
+    for child in block.get('_children', []):
+        lines.append(render_cfg_block(child, indent_level + 1))
+
+    lines.append(f'{indent}}}')
+    return '\n'.join(lines)
+
+
+def load_cfg_nested_blocks(part_data, search_root=DEFAULT_KSP_ROOT):
+    """Load RESOURCE/MODULE blocks for a part directly from the stock cfg."""
+    cfg_path = resolve_part_cfg_path(part_data, search_root=search_root)
+    if cfg_path is None:
+        raise ValueError(f'no stock cfg found for {part_data["name"]}')
+
+    parsed = parse_cfg(cfg_path.read_text(encoding='utf-8-sig'))
+    part_blocks = [child for child in parsed.get('_children', []) if child.get('_type') == 'PART']
+    if not part_blocks:
+        raise ValueError(f'no PART block found in cfg for {part_data["name"]}')
+
+    nested_blocks = [
+        '\tEVENTS\n\t{\n\t}',
+        '\tACTIONS\n\t{\n\t}',
+        '\tPARTDATA\n\t{\n\t}',
+    ]
+
+    for child in part_blocks[0].get('_children', []):
+        if child.get('_type') not in {'MODULE', 'RESOURCE'}:
+            continue
+        nested_blocks.append(render_cfg_block(child))
+
+    return nested_blocks, cfg_path
+
+
+def make_cfg_part_struct(part, rocket_dict, parts_by_name, ksp_id_map, positions, search_root=DEFAULT_KSP_ROOT):
+    """Build a PART structure from the stock part cfg when no craft template exists."""
     x, y, z = positions[part['id']]
     if part['parent'] is None:
         att_pos0 = f'{x},{y},{z}'
@@ -388,13 +455,17 @@ def make_generic_part_struct(part, rocket_dict, parts_by_name, ksp_id_map, posit
     for child_id in children:
         fields.append(('link', ksp_id_map[child_id]))
         child_part = next(p for p in rocket_dict['parts'] if p['id'] == child_id)
-        parent_node = child_part.get('attach_node', 'bottom') or 'bottom'
+        parent_node = choose_parent_attach_node(
+            part['type'],
+            child_part.get('attach_node', 'bottom') or 'bottom',
+            parts_by_name,
+        )
         _, parent_ay, _ = parts_by_name[part['type']]['nodes'][parent_node]['pos']
         fields.append(('attN', f'{parent_node},{ksp_id_map[child_id]}_0|{parent_ay}|0'))
 
     if part['parent'] is not None:
         parent_ksp_id = ksp_id_map[part['parent']]
-        child_node = 'top'
+        child_node = choose_child_attach_node(part['type'], parts_by_name)
         _, ay, _ = parts_by_name[part['type']]['nodes'][child_node]['pos']
         fields.append(('attN', f'{child_node},{parent_ksp_id}_0|{ay}|0'))
 
@@ -403,18 +474,10 @@ def make_generic_part_struct(part, rocket_dict, parts_by_name, ksp_id_map, posit
         '\tACTIONS\n\t{\n\t}',
         '\tPARTDATA\n\t{\n\t}',
     ]
+    cfg_nested_blocks, cfg_path = load_cfg_nested_blocks(parts_by_name[part['type']], search_root=search_root)
+    nested_blocks.extend(cfg_nested_blocks[3:])
 
-    part_data = parts_by_name[part['type']]
-    if part_data.get('engine') is not None:
-        nested_blocks.append(render_generic_engine_module())
-
-    resources = part_data.get('resources') or {}
-    for resource_name, amount in resources.items():
-        nested_blocks.append(render_resource_block(resource_name, amount))
-
-    nested_blocks.append('\t// FALLBACK generic block used for this part type')
-
-    return {'fields': fields, 'nested_blocks': nested_blocks}
+    return {'fields': fields, 'nested_blocks': nested_blocks}, cfg_path
 
 
 def apply_common_overrides(part_struct, part, rocket_dict, ksp_id_map, positions, parts_by_name):
@@ -467,23 +530,27 @@ def apply_common_overrides(part_struct, part, rocket_dict, ksp_id_map, positions
     for child_id in children:
         field_map.append(('link', ksp_id_map[child_id]))
         child_part = next(p for p in rocket_dict['parts'] if p['id'] == child_id)
-        parent_node = child_part.get('attach_node', 'bottom') or 'bottom'
+        parent_node = choose_parent_attach_node(
+            part['type'],
+            child_part.get('attach_node', 'bottom') or 'bottom',
+            parts_by_name,
+        )
         _, parent_ay, _ = parts_by_name[part['type']]['nodes'][parent_node]['pos']
         field_map.append(('attN', f'{parent_node},{ksp_id_map[child_id]}_0|{parent_ay}|0'))
 
     if part['parent'] is not None:
         parent_ksp_id = ksp_id_map[part['parent']]
-        child_node = 'top'
+        child_node = choose_child_attach_node(part['type'], parts_by_name)
         _, ay, _ = parts_by_name[part['type']]['nodes'][child_node]['pos']
         field_map.append(('attN', f'{child_node},{parent_ksp_id}_0|{ay}|0'))
 
-    return {'fields': field_map, 'nested_blocks': part_struct['nested_blocks']}
+    return {'fields': field_map, 'nested_blocks': sanitize_nested_blocks(part_struct['nested_blocks'])}
 
 
 def to_craft(rocket_dict,
              parts_by_name,
              ship_name='prototype craft',
-             search_root='/Users/moss/Library/Application Support/Steam/steamapps/common/Kerbal Space Program'):
+             search_root=DEFAULT_KSP_ROOT):
     """Prototype notebook-extracted serializer for linear-stack VAB craft.
 
     Returns
@@ -505,8 +572,9 @@ def to_craft(rocket_dict,
 
     metadata = {
         'template_parts': [],
-        'fallback_parts': [],
+        'cfg_parts': [],
         'warnings': [],
+        'cfg_sources': {},
         'craft_part_names': craft_part_names,
     }
 
@@ -518,9 +586,16 @@ def to_craft(rocket_dict,
             updated = apply_common_overrides(parsed, part, rocket_dict, ksp_id_map, positions, parts_by_name)
             metadata['template_parts'].append(part['type'])
         else:
-            updated = make_generic_part_struct(part, rocket_dict, parts_by_name, ksp_id_map, positions)
-            metadata['fallback_parts'].append(part['type'])
-            metadata['warnings'].append(f'used generic fallback block for {part["type"]}')
+            updated, cfg_path = make_cfg_part_struct(
+                part,
+                rocket_dict,
+                parts_by_name,
+                ksp_id_map,
+                positions,
+                search_root=search_root,
+            )
+            metadata['cfg_parts'].append(part['type'])
+            metadata['cfg_sources'][part['type']] = str(cfg_path)
 
         part_blocks.append(render_part_template_struct(updated))
 

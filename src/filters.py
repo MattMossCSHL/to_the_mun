@@ -47,16 +47,43 @@ def calculate_thrust(parts_list: list,
     return total_thrust
 
 
-def calculate_twr(parts_list: list,
-                  parts_dict: dict,
-                  fuel_lookup: dict,
-                  g_const: float = 9.80665):
-    """Return thrust-to-weight ratio at launch (sea level, full propellant load)."""
+def get_launch_engine_id(rocket_dict: dict,
+                         parts_dict: dict):
+    """Return the id of the highest-staged engine, treated as the liftoff engine."""
 
-    mass = get_total_mass(parts_list, parts_dict, fuel_lookup)
-    thrust = calculate_thrust(parts_list, parts_dict)
-    twr = thrust / (mass * g_const)
+    id_to_type = {p['id']: p['type'] for p in rocket_dict['parts']}
+    launch_engine_id = None
+    launch_stage = None
 
+    for part_id, stage_num in rocket_dict['stages'].items():
+        part_type = id_to_type[part_id]
+        if parts_dict[part_type]['engine'] is None:
+            continue
+
+        if launch_stage is None or stage_num > launch_stage:
+            launch_stage = stage_num
+            launch_engine_id = part_id
+
+    return launch_engine_id
+
+
+def calculate_launch_twr(rocket_dict: dict,
+                         parts_list: list,
+                         parts_dict: dict,
+                         fuel_lookup: dict,
+                         g_const: float = 9.80665):
+    """Return launch TWR using only the highest-staged engine over full wet-stack mass."""
+
+    id_to_type = {p['id']: p['type'] for p in rocket_dict['parts']}
+    launch_engine_id = get_launch_engine_id(rocket_dict, parts_dict)
+    if launch_engine_id is None:
+        return 0.0
+
+    launch_engine_type = id_to_type[launch_engine_id]
+    launch_thrust = parts_dict[launch_engine_type]['engine']['max_thrust_kn']
+    total_mass = get_total_mass(parts_list, parts_dict, fuel_lookup)
+
+    twr = launch_thrust / (total_mass * g_const)
     return twr
 
 
@@ -168,6 +195,48 @@ def stage_has_air_breathing_engine(stage_parts: list,
     return any(is_air_breathing_engine(part, parts_by_name) for part in stage_parts)
 
 
+def get_stage_usable_propellant_mass(engine_id: str,
+                                     id_to_type: dict,
+                                     id_to_parent: dict,
+                                     parts_dict: dict,
+                                     resource_lookup: dict):
+    """Return the mass of propellant that can actually be burned in the engine's required mix."""
+
+    engine_type = id_to_type[engine_id]
+    propellant_mix = parts_dict[engine_type]['engine']['propellants']
+
+    available_units = {name: 0.0 for name in propellant_mix}
+
+    current = engine_id
+    while current is not None:
+        current_type = id_to_type[current]
+        if current_type.startswith('Decoupler'):
+            break
+
+        part_resources = parts_dict[current_type]['resources']
+        if part_resources is not None:
+            for propellant in propellant_mix:
+                available_units[propellant] += part_resources.get(propellant, 0.0)
+
+        current = id_to_parent[current]
+
+    if any(available_units[propellant] <= 0 for propellant in propellant_mix):
+        return 0.0
+
+    burn_ratios = []
+    for propellant, required_units in propellant_mix.items():
+        burn_ratios.append(available_units[propellant] / required_units)
+
+    limiting_ratio = min(burn_ratios)
+
+    usable_mass = 0.0
+    for propellant, required_units in propellant_mix.items():
+        usable_units = limiting_ratio * required_units
+        usable_mass += usable_units * resource_lookup[propellant]['density']
+
+    return usable_mass
+
+
 def compute_delta_v(rocket_dict: dict,
                     parts_list: list,
                     parts_dict: dict,
@@ -227,22 +296,18 @@ def compute_delta_v(rocket_dict: dict,
             if rocket_dict['stages'].get(part['id']) == stage_num
         ]
 
-        fuel_mass = 0
-
-        propellants = parts_dict[id_to_type[engine_id]]['engine']['propellants'].keys()
-        current = engine_id
-        while current is not None:
-            current_type = id_to_type[current]
-            if current_type.startswith('Decoupler'):
-                break
-            part_resources = parts_dict[current_type]['resources']
-            if part_resources is not None:
-                for resource, amount in part_resources.items():
-                    if resource in propellants:
-                        fuel_mass += amount * resource_lookup[resource]['density']
-                        if verbose:
-                            print(f'current fuel mass is {fuel_mass}')
-            current = id_to_parent[current]
+        fuel_mass = get_stage_usable_propellant_mass(
+            engine_id,
+            id_to_type,
+            id_to_parent,
+            parts_dict,
+            resource_lookup
+        )
+        if fuel_mass <= 0:
+            stage_dvs[stage_num] = 0
+            if verbose:
+                print(f"stage {stage_num}: no valid propellant mixture, dv=0")
+            continue
 
         engine_type = id_to_type[engine_id]
         thrust = parts_dict[engine_type]['engine']['max_thrust_kn']
@@ -359,22 +424,16 @@ def compute_burn_time(rocket_dict: dict,
         if engine_id is None:
             continue
 
-        fuel_mass = 0
-
-        propellants = parts_dict[id_to_type[engine_id]]['engine']['propellants'].keys()
-        current = engine_id
-        while current is not None:
-            current_type = id_to_type[current]
-            if current_type.startswith('Decoupler'):
-                break
-            part_resources = parts_dict[current_type]['resources']
-            if part_resources is not None:
-                for resource, amount in part_resources.items():
-                    if resource in propellants:
-                        fuel_mass += amount * resource_lookup[resource]['density']
-                        if verbose:
-                            print(f'current fuel mass is {fuel_mass}')
-            current = id_to_parent[current]
+        fuel_mass = get_stage_usable_propellant_mass(
+            engine_id,
+            id_to_type,
+            id_to_parent,
+            parts_dict,
+            resource_lookup
+        )
+        if fuel_mass <= 0:
+            burn_times[stage_num] = 0.0
+            continue
 
         ### burn time calculation
         engine_type = id_to_type[engine_id]
@@ -411,7 +470,7 @@ def filter_rocket(rocket_dict: dict,
 
     dv_goal = dv_thresholds[goal]
 
-    twr = calculate_twr(parts_list, parts_dict, resource_lookup)
+    twr = calculate_launch_twr(rocket_dict, parts_list, parts_dict, resource_lookup)
     dv = compute_delta_v(rocket_dict, parts_list, parts_dict, resource_lookup, g_const = g_const)
     burn_time = compute_burn_time(rocket_dict, parts_list, parts_dict, resource_lookup, g_const = g_const)
 

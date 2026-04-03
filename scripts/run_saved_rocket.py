@@ -307,8 +307,10 @@ def phase_angle(vessel, target_body, central_body):
     frame = central_body.non_rotating_reference_frame
     vessel_pos = vessel.position(frame)
     target_pos = target_body.position(frame)
-    vessel_angle = math.atan2(vessel_pos[1], vessel_pos[0])
-    target_angle = math.atan2(target_pos[1], target_pos[0])
+    # KSP's non-rotating body frame uses X/Z for the equatorial orbital plane.
+    # Using Y here makes the phase angle jump around the +/-180deg boundary.
+    vessel_angle = math.atan2(vessel_pos[2], vessel_pos[0])
+    target_angle = math.atan2(target_pos[2], target_pos[0])
     return normalize_angle(target_angle - vessel_angle)
 
 
@@ -344,6 +346,37 @@ def stabilize_after_stage(
             return True
         time.sleep(0.1)
     return False
+
+
+def stabilize_vehicle(
+    vessel,
+    ap,
+    target_pitch,
+    target_heading=90,
+    verbose=False,
+    label="stabilize_only",
+    post_stage_mode="pitch_heading",
+):
+    control = vessel.control
+    before_spin = angular_speed(vessel)
+    if post_stage_mode == "orbit_target":
+        set_orbital_insertion_attitude(vessel, ap, verbose=verbose, label=label)
+    else:
+        ap.engage()
+        ap.target_roll = float("nan")
+        ap.target_pitch_and_heading(target_pitch, target_heading)
+
+    stable = stabilize_after_stage(vessel, ap, target_pitch, target_heading=target_heading)
+    after_spin = angular_speed(vessel)
+    control.throttle = 0.0
+
+    if verbose:
+        print(
+            f"{label}: complete stable={stable} angular_speed_before={before_spin:.3f} "
+            f"angular_speed_after={after_spin:.3f} peri={vessel.orbit.periapsis_altitude:.0f} "
+            f"throttle={control.throttle:.2f}"
+        )
+    return stable
 
 
 def set_orbital_insertion_attitude(vessel, ap, verbose=False, label="orbit_target"):
@@ -473,6 +506,63 @@ def set_turn_pitch(vessel, turn_start_altitude, turn_end_altitude):
     vessel.auto_pilot.target_pitch_and_heading(pitch, 90)
 
 
+def desired_rails_warp_for_seconds(seconds_until_event):
+    if seconds_until_event > 3600:
+        return 7
+    if seconds_until_event > 1200:
+        return 6
+    if seconds_until_event > 300:
+        return 5
+    if seconds_until_event > 90:
+        return 4
+    if seconds_until_event > 30:
+        return 3
+    if seconds_until_event > 10:
+        return 2
+    return 0
+
+
+def desired_rails_warp_for_apoapsis_coast(seconds_until_apoapsis):
+    if seconds_until_apoapsis > 1800:
+        return 6
+    if seconds_until_apoapsis > 600:
+        return 5
+    if seconds_until_apoapsis > 180:
+        return 3
+    if seconds_until_apoapsis > 90:
+        return 2
+    if seconds_until_apoapsis > 45:
+        return 1
+    return 0
+
+
+def desired_rails_warp_for_phase_error(error_deg):
+    if error_deg > 60:
+        return 6
+    if error_deg > 25:
+        return 5
+    if error_deg > 10:
+        return 4
+    if error_deg > 3:
+        return 3
+    if error_deg > 1:
+        return 2
+    return 0
+
+
+def set_rails_warp(sc, factor, verbose=False, label="warp"):
+    factor = int(max(0, factor))
+    if sc.rails_warp_factor == factor:
+        return
+    sc.rails_warp_factor = factor
+    if verbose:
+        print(f"{label}: rails_warp_factor={factor}")
+
+
+def clear_rails_warp(sc, verbose=False, label="warp"):
+    set_rails_warp(sc, 0, verbose=verbose, label=label)
+
+
 def launch_from_vab(sc, ship_name: str):
     sc.launch_vessel_from_vab(ship_name)
     time.sleep(1.0)
@@ -483,6 +573,7 @@ def fly_standard_ascent(
     rocket_dict,
     parts_by_name,
     vessel,
+    sc=None,
     target_apoapsis=80_000,
     target_periapsis=70_000,
     periapsis_cutoff=None,
@@ -504,6 +595,8 @@ def fly_standard_ascent(
     diagnostics = {
         "designed_stage_propellants": {str(k): list(v) for k, v in stage_propellants.items()},
     }
+    handoff_periapsis_min = max(target_periapsis * 0.5, 30_000.0)
+    handoff_remaining_max = handoff_fuel_threshold * 2.0
 
     control = vessel.control
     ap = vessel.auto_pilot
@@ -554,9 +647,9 @@ def fly_standard_ascent(
             })
             break
         if apoapsis > target_apoapsis * 0.9:
-            control.throttle = 0.25
+            control.throttle = min(control.throttle, 0.25)
         if apoapsis > target_apoapsis * 0.98:
-            control.throttle = 0.1
+            control.throttle = min(control.throttle, 0.10)
 
         current_pitch = ap.target_pitch
         staged = maybe_stage(vessel, propellants, stage_state)
@@ -578,31 +671,40 @@ def fly_standard_ascent(
             remaining = stage_resource_amount(vessel, stage_state["monitored_stage"], propellants)
 
         should_handoff = (
-            apoapsis >= target_apoapsis
-            and altitude >= handoff_altitude
+            altitude >= handoff_altitude
+            and control.current_stage > 0
+            and apoapsis >= target_apoapsis
+            and periapsis >= handoff_periapsis_min
             and remaining is not None
-            and remaining <= handoff_fuel_threshold
+            and remaining <= handoff_remaining_max
         )
         if should_handoff:
             if verbose:
                 print(
                     f"handoff gate reached alt={altitude:.0f} apo={apoapsis:.0f} "
-                    f"remaining={remaining:.1f}; handing off to the next phase/stage"
+                    f"peri={periapsis:.0f} remaining={remaining:.1f} "
+                    f"handoff_peri_min={handoff_periapsis_min:.0f} "
+                    f"handoff_remaining_max={handoff_remaining_max:.1f}; "
+                    "handing off to the next phase/stage"
                 )
             control.throttle = 0.0
             if stage_state["monitored_stage"] is not None and vessel.control.current_stage > 0:
                 handoff_to_upper_stage(vessel, stage_state, propellants)
                 time.sleep(1.0)
-                stage_with_stability(
+                stable = stabilize_vehicle(
                     vessel,
                     ap,
-                    stage_state,
                     0.0,
-                    throttle_resume=0.0,
                     verbose=verbose,
                     label="phase_handoff",
                     post_stage_mode="orbit_target",
                 )
+                stage_state.setdefault("events", []).append({
+                    "time": time.time(),
+                    "kind": "phase_handoff_stabilized" if stable else "phase_handoff_unstable_timeout",
+                    "angular_speed_after": angular_speed(vessel),
+                    "target_pitch": 0.0,
+                })
                 if verbose:
                     print(
                         f"phase_handoff: post-stage current_stage={control.current_stage} "
@@ -625,59 +727,94 @@ def fly_standard_ascent(
     control.throttle = 0.0
 
     if handed_off:
+        missed_apoapsis = False
+        prev_time_to_apoapsis = None
         while vessel.orbit.time_to_apoapsis > 20:
             hold_orbital_insertion_guidance(vessel, ap)
             maybe_stage(vessel, propellants, stage_state)
+            time_to_apoapsis = vessel.orbit.time_to_apoapsis
+            if (
+                prev_time_to_apoapsis is not None
+                and prev_time_to_apoapsis < 600
+                and time_to_apoapsis > prev_time_to_apoapsis + 60
+            ):
+                missed_apoapsis = True
+                stage_state.setdefault("events", []).append({
+                    "time": time.time(),
+                    "kind": "orbital_insertion_missed_apoapsis",
+                    "previous_time_to_apoapsis": prev_time_to_apoapsis,
+                    "time_to_apoapsis": time_to_apoapsis,
+                    "apoapsis": vessel.orbit.apoapsis_altitude,
+                    "periapsis": vessel.orbit.periapsis_altitude,
+                })
+                if verbose:
+                    print(
+                        f"coast missed apoapsis previous_ttAp={prev_time_to_apoapsis:.1f}s "
+                        f"ttAp={time_to_apoapsis:.1f}s apo={vessel.orbit.apoapsis_altitude:.0f} "
+                        f"peri={vessel.orbit.periapsis_altitude:.0f}"
+                    )
+                break
+            if sc is not None:
+                set_rails_warp(
+                    sc,
+                    desired_rails_warp_for_apoapsis_coast(time_to_apoapsis),
+                    verbose=verbose,
+                    label="coast_warp",
+                )
             if verbose:
                 print(
                     f"coast apo={vessel.orbit.apoapsis_altitude:8.0f}m "
                     f"peri={vessel.orbit.periapsis_altitude:8.0f}m "
-                    f"ttAp={vessel.orbit.time_to_apoapsis:6.1f}s "
+                    f"ttAp={time_to_apoapsis:6.1f}s "
                     f"stage={control.current_stage}"
                 )
+            prev_time_to_apoapsis = time_to_apoapsis
             time.sleep(0.5)
+        if sc is not None:
+            clear_rails_warp(sc, verbose=verbose, label="coast_warp")
 
-        hold_orbital_insertion_guidance(vessel, ap, verbose=verbose, label="orbital_insertion")
-        insertion_start = time.time()
-        control.throttle = 1.0
-        while vessel.orbit.periapsis_altitude < target_periapsis:
-            hold_orbital_insertion_guidance(vessel, ap)
-            maybe_stage(vessel, propellants, stage_state)
-            if vessel.available_thrust < 1e-3:
-                stage_with_stability(
-                    vessel,
-                    ap,
-                    stage_state,
-                    0.0,
-                    throttle_resume=0.2,
-                    verbose=verbose,
-                    label="orbital_insertion_stage",
-                    post_stage_mode="orbit_target",
-                )
-            periapsis = vessel.orbit.periapsis_altitude
-            apoapsis = vessel.orbit.apoapsis_altitude
-            if verbose:
-                print(
-                    f"insertion peri={periapsis:8.0f}m apo={apoapsis:8.0f}m "
-                    f"ttAp={vessel.orbit.time_to_apoapsis:6.1f}s "
-                    f"stage={control.current_stage} throttle={control.throttle:.2f}"
-                )
-            if vessel.orbit.time_to_apoapsis < -5:
-                break
-            if time.time() - insertion_start > 240:
-                stage_state.setdefault("events", []).append({
-                    "time": time.time(),
-                    "kind": "orbital_insertion_timeout",
-                    "periapsis": vessel.orbit.periapsis_altitude,
-                    "apoapsis": vessel.orbit.apoapsis_altitude,
-                })
-                break
-            if periapsis > target_periapsis * 0.9:
-                control.throttle = 0.25
-            if periapsis > target_periapsis * 0.98:
-                control.throttle = 0.1
-            time.sleep(0.1)
-        control.throttle = 0.0
+        if not missed_apoapsis:
+            hold_orbital_insertion_guidance(vessel, ap, verbose=verbose, label="orbital_insertion")
+            insertion_start = time.time()
+            control.throttle = 1.0
+            while vessel.orbit.periapsis_altitude < target_periapsis:
+                hold_orbital_insertion_guidance(vessel, ap)
+                maybe_stage(vessel, propellants, stage_state)
+                if vessel.available_thrust < 1e-3:
+                    stage_with_stability(
+                        vessel,
+                        ap,
+                        stage_state,
+                        0.0,
+                        throttle_resume=0.2,
+                        verbose=verbose,
+                        label="orbital_insertion_stage",
+                        post_stage_mode="orbit_target",
+                    )
+                periapsis = vessel.orbit.periapsis_altitude
+                apoapsis = vessel.orbit.apoapsis_altitude
+                if verbose:
+                    print(
+                        f"insertion peri={periapsis:8.0f}m apo={apoapsis:8.0f}m "
+                        f"ttAp={vessel.orbit.time_to_apoapsis:6.1f}s "
+                        f"stage={control.current_stage} throttle={control.throttle:.2f}"
+                    )
+                if vessel.orbit.time_to_apoapsis < -5:
+                    break
+                if time.time() - insertion_start > 240:
+                    stage_state.setdefault("events", []).append({
+                        "time": time.time(),
+                        "kind": "orbital_insertion_timeout",
+                        "periapsis": vessel.orbit.periapsis_altitude,
+                        "apoapsis": vessel.orbit.apoapsis_altitude,
+                    })
+                    break
+                if periapsis > target_periapsis * 0.9:
+                    control.throttle = 0.25
+                if periapsis > target_periapsis * 0.98:
+                    control.throttle = 0.1
+                time.sleep(0.1)
+            control.throttle = 0.0
 
     return {
         "final_apoapsis": vessel.orbit.apoapsis_altitude,
@@ -689,6 +826,7 @@ def fly_standard_ascent(
 
 
 def wait_for_transfer_window(
+    sc,
     vessel,
     target_body,
     central_body,
@@ -701,6 +839,14 @@ def wait_for_transfer_window(
     while time.time() - start < timeout:
         current_phase = phase_angle(vessel, target_body, central_body)
         error = normalize_angle(current_phase - required_phase)
+        error_deg = abs(math.degrees(error))
+        if sc is not None:
+            set_rails_warp(
+                sc,
+                desired_rails_warp_for_phase_error(error_deg),
+                verbose=verbose,
+                label="transfer_window_warp",
+            )
         if verbose:
             print(
                 f"transfer_window target={target_body.name} "
@@ -709,12 +855,16 @@ def wait_for_transfer_window(
                 f"error={math.degrees(error):6.2f}deg"
             )
         if abs(error) <= tolerance_rad:
+            if sc is not None:
+                clear_rails_warp(sc, verbose=verbose, label="transfer_window_warp")
             return {
                 "phase_deg": math.degrees(current_phase),
                 "required_phase_deg": math.degrees(required_phase),
                 "error_deg": math.degrees(error),
             }
         time.sleep(2.0)
+    if sc is not None:
+        clear_rails_warp(sc, verbose=verbose, label="transfer_window_warp")
     return None
 
 
@@ -765,22 +915,35 @@ def burn_until_apoapsis(
     return True
 
 
-def wait_for_body_change(vessel, body_name, verbose=False, timeout=21600.0):
+def wait_for_body_change(sc, vessel, body_name, verbose=False, timeout=21600.0):
     start = time.time()
     while time.time() - start < timeout:
         current_name = vessel.orbit.body.name
+        if sc is not None:
+            seconds_until_event = max(vessel.orbit.time_to_soi_change, 0.0)
+            set_rails_warp(
+                sc,
+                desired_rails_warp_for_seconds(seconds_until_event),
+                verbose=verbose,
+                label="soi_coast_warp",
+            )
         if verbose:
             print(
                 f"coast_to_soi current_body={current_name} "
                 f"apo={vessel.orbit.apoapsis_altitude:.0f} peri={vessel.orbit.periapsis_altitude:.0f}"
             )
         if current_name == body_name:
+            if sc is not None:
+                clear_rails_warp(sc, verbose=verbose, label="soi_coast_warp")
             return True
         time.sleep(5.0)
+    if sc is not None:
+        clear_rails_warp(sc, verbose=verbose, label="soi_coast_warp")
     return False
 
 
 def capture_at_body(
+    sc,
     vessel,
     ap,
     stage_state,
@@ -793,6 +956,13 @@ def capture_at_body(
     control = vessel.control
     start = time.time()
     while vessel.orbit.body.name == body_name and vessel.orbit.time_to_periapsis > 30:
+        if sc is not None:
+            set_rails_warp(
+                sc,
+                desired_rails_warp_for_seconds(vessel.orbit.time_to_periapsis),
+                verbose=verbose,
+                label="capture_coast_warp",
+            )
         if verbose:
             print(
                 f"mun_coast peri={vessel.orbit.periapsis_altitude:8.0f}m "
@@ -800,6 +970,8 @@ def capture_at_body(
                 f"ttPe={vessel.orbit.time_to_periapsis:6.1f}s"
             )
         time.sleep(1.0)
+    if sc is not None:
+        clear_rails_warp(sc, verbose=verbose, label="capture_coast_warp")
 
     hold_retrograde_guidance(vessel, ap, verbose=verbose, label="mun_capture")
     control.throttle = 1.0
@@ -845,6 +1017,7 @@ def fly_mun_mission(
     rocket_dict,
     parts_by_name,
     vessel,
+    sc=None,
     target_apoapsis=80_000,
     target_periapsis=70_000,
     periapsis_cutoff=None,
@@ -860,6 +1033,7 @@ def fly_mun_mission(
         rocket_dict,
         parts_by_name,
         vessel,
+        sc=sc,
         target_apoapsis=target_apoapsis,
         target_periapsis=target_periapsis,
         periapsis_cutoff=periapsis_cutoff,
@@ -893,6 +1067,7 @@ def fly_mun_mission(
     required_phase = normalize_angle(math.pi - mun_mean_motion * transfer_time)
 
     window = wait_for_transfer_window(
+        sc,
         vessel,
         mun,
         kerbin,
@@ -925,7 +1100,7 @@ def fly_mun_mission(
         result["stage_events"] = stage_state["events"]
         return result
 
-    soi_ok = wait_for_body_change(vessel, "Mun", verbose=verbose)
+    soi_ok = wait_for_body_change(sc, vessel, "Mun", verbose=verbose)
     if not soi_ok:
         result["mission_phase"] = "mun_soi_timeout"
         result["stage_events"] = stage_state["events"]
@@ -938,6 +1113,7 @@ def fly_mun_mission(
     })
 
     captured = capture_at_body(
+        sc,
         vessel,
         vessel.auto_pilot,
         stage_state,
@@ -983,6 +1159,7 @@ def main():
             selected["rocket"],
             parts_by_name,
             vessel,
+            sc=sc,
             target_apoapsis=args.target_apoapsis,
             target_periapsis=args.target_periapsis,
             periapsis_cutoff=args.periapsis_cutoff,
@@ -999,6 +1176,7 @@ def main():
             selected["rocket"],
             parts_by_name,
             vessel,
+            sc=sc,
             target_apoapsis=args.target_apoapsis,
             target_periapsis=args.target_periapsis,
             periapsis_cutoff=args.periapsis_cutoff,
