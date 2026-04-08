@@ -21,6 +21,7 @@ Current assumptions
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime
 import json
 import math
@@ -181,6 +182,92 @@ def write_run_record(run_dir: Path, record: dict):
     return out_path
 
 
+def format_met(vessel):
+    seconds = max(0, int(vessel.met))
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"T+{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def verbose_log(vessel, label, message):
+    print(f"[{format_met(vessel)}] {label}: {message}")
+
+
+def verbose_log_change(vessel, cache, key, value, label, message):
+    if cache.get(key) == value:
+        return
+    cache[key] = value
+    verbose_log(vessel, label, message)
+
+
+def part_name_counter(vessel):
+    return Counter(part.name for part in vessel.parts.all)
+
+
+def counter_delta(before, after):
+    removed = {}
+    added = {}
+    for name, count in before.items():
+        delta = count - after.get(name, 0)
+        if delta > 0:
+            removed[name] = delta
+    for name, count in after.items():
+        delta = count - before.get(name, 0)
+        if delta > 0:
+            added[name] = delta
+    return removed, added
+
+
+def summarize_counter(counter_obj):
+    if not counter_obj:
+        return "none"
+    return ", ".join(f"{name}x{count}" for name, count in sorted(counter_obj.items()))
+
+
+def vessel_composition_snapshot(vessel):
+    counter = part_name_counter(vessel)
+    return {
+        "part_count": sum(counter.values()),
+        "parts": dict(sorted(counter.items())),
+        "mass": vessel.mass,
+        "available_thrust": vessel.available_thrust,
+        "current_stage": vessel.control.current_stage,
+    }
+
+
+def safe_getattr(obj, name, default=None):
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def engine_runtime_snapshot(vessel):
+    snapshots = []
+    engines = safe_getattr(safe_getattr(vessel, "parts"), "engines", []) or []
+    for engine in engines:
+        part = safe_getattr(engine, "part")
+        part_title = safe_getattr(part, "title", safe_getattr(part, "name", "unknown"))
+        snapshot = {
+            "part_title": part_title,
+            "part_name": safe_getattr(part, "name"),
+            "stage": safe_getattr(part, "stage"),
+            "decouple_stage": safe_getattr(part, "decouple_stage"),
+            "active": safe_getattr(engine, "active"),
+            "available_thrust": safe_getattr(engine, "available_thrust"),
+            "thrust": safe_getattr(engine, "thrust"),
+            "max_thrust": safe_getattr(engine, "max_thrust"),
+            "specific_impulse": safe_getattr(engine, "specific_impulse"),
+            "vacuum_specific_impulse": safe_getattr(engine, "vacuum_specific_impulse"),
+            "kerbin_sea_level_specific_impulse": safe_getattr(engine, "kerbin_sea_level_specific_impulse"),
+            "throttle": safe_getattr(engine, "throttle"),
+            "gimballed": safe_getattr(engine, "gimballed"),
+            "has_fuel": safe_getattr(engine, "has_fuel"),
+        }
+        snapshots.append(snapshot)
+    return snapshots
+
+
 def capture_prelaunch_screenshot(run_dir: Path):
     out_path = run_dir / "prelaunch.png"
     subprocess.run(["screencapture", "-x", str(out_path)], check=True)
@@ -224,13 +311,29 @@ def monitored_propellants(stage_propellants):
     return tuple(sorted(names))
 
 
-def stage_resource_amount(vessel, ksp_stage, propellants):
-    resources = vessel.resources_in_decouple_stage(ksp_stage, cumulative=False)
+def stage_resource_amount(vessel, ksp_stage, propellants, cumulative=True):
+    resources = vessel.resources_in_decouple_stage(ksp_stage, cumulative=cumulative)
     total = 0.0
     for resource_name in propellants:
         if resources.has_resource(resource_name):
             total += resources.amount(resource_name)
     return total
+
+
+def stage_resource_breakdown(vessel, ksp_stage, propellants, cumulative=True):
+    resources = vessel.resources_in_decouple_stage(ksp_stage, cumulative=cumulative)
+    breakdown = {}
+    for resource_name in propellants:
+        breakdown[resource_name] = resources.amount(resource_name) if resources.has_resource(resource_name) else 0.0
+    return breakdown
+
+
+def vessel_resource_breakdown(vessel, propellants):
+    resources = vessel.resources
+    breakdown = {}
+    for resource_name in propellants:
+        breakdown[resource_name] = resources.amount(resource_name) if resources.has_resource(resource_name) else 0.0
+    return breakdown
 
 
 def current_fueled_stage(vessel, propellants, empty_threshold=0.1, max_stage=None):
@@ -246,7 +349,10 @@ def current_fueled_stage(vessel, propellants, empty_threshold=0.1, max_stage=Non
 def debug_stage_resources(vessel, propellants, max_stage):
     snapshot = {}
     for ksp_stage in range(max_stage, -1, -1):
-        snapshot[ksp_stage] = stage_resource_amount(vessel, ksp_stage, propellants)
+        snapshot[ksp_stage] = {
+            "cumulative": stage_resource_amount(vessel, ksp_stage, propellants, cumulative=True),
+            "exclusive": stage_resource_amount(vessel, ksp_stage, propellants, cumulative=False),
+        }
     return snapshot
 
 
@@ -268,16 +374,70 @@ def maybe_stage(vessel, propellants, state, empty_threshold=0.1, min_stage_gap=0
     if now - state.get("last_stage_time", 0.0) < min_stage_gap:
         return False
 
+    before_parts = part_name_counter(vessel)
     control.activate_next_stage()
     state["last_stage_time"] = now
     state["monitored_stage"] = current_fueled_stage(vessel, propellants, empty_threshold)
+    after_parts = part_name_counter(vessel)
+    removed_parts, added_parts = counter_delta(before_parts, after_parts)
+    snapshot = propulsion_snapshot(vessel, propellants, state, empty_threshold=empty_threshold)
     state.setdefault("events", []).append({
         "time": now,
         "kind": "auto_stage_fuel_empty",
         "new_current_stage": control.current_stage,
         "new_monitored_stage": state["monitored_stage"],
+        "removed_parts": removed_parts,
+        "added_parts": added_parts,
+        "propulsion_snapshot": snapshot,
     })
     return True
+
+
+def has_lower_fueled_stage(vessel, propellants, empty_threshold=0.1):
+    control = vessel.control
+    if control.current_stage <= 0:
+        return False
+    next_fueled_stage = current_fueled_stage(
+        vessel,
+        propellants,
+        empty_threshold=empty_threshold,
+        max_stage=control.current_stage - 1,
+    )
+    return next_fueled_stage is not None
+
+
+def propulsion_snapshot(vessel, propellants, stage_state, empty_threshold=0.1):
+    control = vessel.control
+    monitored_stage = stage_state.get("monitored_stage")
+    current_stage = control.current_stage
+    lower_fueled_stage = current_fueled_stage(
+        vessel,
+        propellants,
+        empty_threshold=empty_threshold,
+        max_stage=current_stage,
+    )
+    snapshot = {
+        "current_stage": current_stage,
+        "monitored_stage": monitored_stage,
+        "lower_fueled_stage": lower_fueled_stage,
+        "available_thrust": vessel.available_thrust,
+        "actual_thrust": vessel.thrust,
+        "throttle": control.throttle,
+        "apoapsis": vessel.orbit.apoapsis_altitude,
+        "periapsis": vessel.orbit.periapsis_altitude,
+        "mass": vessel.mass,
+        "vessel_resource_breakdown": vessel_resource_breakdown(vessel, propellants),
+        "engine_runtime": engine_runtime_snapshot(vessel),
+    }
+    if monitored_stage is not None:
+        snapshot["monitored_stage_resources"] = stage_resource_amount(vessel, monitored_stage, propellants)
+        snapshot["monitored_stage_breakdown"] = stage_resource_breakdown(vessel, monitored_stage, propellants)
+    if lower_fueled_stage is not None:
+        snapshot["lower_fueled_stage_resources"] = stage_resource_amount(vessel, lower_fueled_stage, propellants)
+        snapshot["lower_fueled_stage_breakdown"] = stage_resource_breakdown(vessel, lower_fueled_stage, propellants)
+    if current_stage is not None and current_stage >= 0:
+        snapshot["current_stage_breakdown"] = stage_resource_breakdown(vessel, current_stage, propellants)
+    return snapshot
 
 
 def angular_speed(vessel):
@@ -321,6 +481,18 @@ def set_velocity_frame_attitude(vessel, ap, forward=True, verbose=False, label="
         direction = "prograde" if forward else "retrograde"
         print(
             f"{label}: reference_frame=surface_velocity mode={direction} "
+            f"body={vessel.orbit.body.name} apo={vessel.orbit.apoapsis_altitude:.0f} "
+            f"peri={vessel.orbit.periapsis_altitude:.0f}"
+        )
+
+
+def set_orbital_velocity_attitude(vessel, ap, forward=True, verbose=False, label="orbital_target"):
+    ap.reference_frame = vessel.orbital_reference_frame
+    ap.target_direction = (0, 1, 0) if forward else (0, -1, 0)
+    if verbose:
+        direction = "prograde" if forward else "retrograde"
+        print(
+            f"{label}: reference_frame=orbital mode={direction} "
             f"body={vessel.orbit.body.name} apo={vessel.orbit.apoapsis_altitude:.0f} "
             f"peri={vessel.orbit.periapsis_altitude:.0f}"
         )
@@ -380,12 +552,12 @@ def stabilize_vehicle(
 
 
 def set_orbital_insertion_attitude(vessel, ap, verbose=False, label="orbit_target"):
-    """Point the vessel near prograde for orbital insertion after upper-stage handoff."""
-    set_velocity_frame_attitude(vessel, ap, forward=True, verbose=verbose, label=label)
+    """Point the vessel at orbital prograde for vacuum orbital maneuvers."""
+    set_orbital_velocity_attitude(vessel, ap, forward=True, verbose=verbose, label=label)
 
 
 def set_retrograde_attitude(vessel, ap, verbose=False, label="retrograde_target"):
-    set_velocity_frame_attitude(vessel, ap, forward=False, verbose=verbose, label=label)
+    set_orbital_velocity_attitude(vessel, ap, forward=False, verbose=verbose, label=label)
 
 
 def stage_with_stability(
@@ -405,9 +577,13 @@ def stage_with_stability(
     before_stage = control.current_stage
     before_spin = angular_speed(vessel)
     if verbose:
-        print(
+        removed_parts = stage_state["events"][-1].get("removed_parts", {})
+        snapshot = vessel_composition_snapshot(vessel)
+        verbose_log(
+            vessel,
+            label,
             f"{label}: begin current_stage={before_stage} throttle={original_throttle:.2f} "
-            f"angular_speed={before_spin:.3f} target_pitch={target_pitch:.1f}"
+            f"angular_speed={before_spin:.3f} target_pitch={target_pitch:.1f}",
         )
     control.throttle = pre_stage_throttle
     time.sleep(0.5)
@@ -437,10 +613,15 @@ def stage_with_stability(
         "stage_after": control.current_stage,
     })
     if verbose:
-        print(
+        removed_parts = stage_state["events"][-1].get("removed_parts", {})
+        snapshot = vessel_composition_snapshot(vessel)
+        verbose_log(
+            vessel,
+            label,
             f"{label}: complete stage_before={before_stage} stage_after={control.current_stage} "
             f"stable={stable} angular_speed_after={after_spin:.3f} "
-            f"peri={vessel.orbit.periapsis_altitude:.0f} throttle={control.throttle:.2f}"
+            f"peri={vessel.orbit.periapsis_altitude:.0f} throttle={control.throttle:.2f} "
+            f"removed={summarize_counter(removed_parts)} remaining={summarize_counter(snapshot['parts'])}",
         )
     return True
 
@@ -464,13 +645,20 @@ def ensure_thrust_available(vessel, stage_state, min_stage_gap=0.75):
     now = time.time()
     if now - stage_state.get("last_stage_time", 0.0) < min_stage_gap:
         return False
+    before_parts = part_name_counter(vessel)
     control.activate_next_stage()
     stage_state["last_stage_time"] = now
+    after_parts = part_name_counter(vessel)
+    removed_parts, added_parts = counter_delta(before_parts, after_parts)
+    snapshot = vessel_composition_snapshot(vessel)
     stage_state.setdefault("events", []).append({
         "time": now,
         "kind": "auto_stage_ensure_thrust",
         "new_current_stage": control.current_stage,
         "new_monitored_stage": stage_state.get("monitored_stage"),
+        "removed_parts": removed_parts,
+        "added_parts": added_parts,
+        "vessel_snapshot": snapshot,
     })
     return True
 
@@ -482,15 +670,58 @@ def handoff_to_upper_stage(vessel, stage_state, propellants, min_stage_gap=0.75)
     now = time.time()
     if now - stage_state.get("last_stage_time", 0.0) < min_stage_gap:
         return False
+    before_parts = part_name_counter(vessel)
     control.activate_next_stage()
     stage_state["last_stage_time"] = now
     stage_state["monitored_stage"] = current_fueled_stage(vessel, propellants)
+    after_parts = part_name_counter(vessel)
+    removed_parts, added_parts = counter_delta(before_parts, after_parts)
+    snapshot = propulsion_snapshot(vessel, propellants, stage_state)
     stage_state.setdefault("events", []).append({
         "time": now,
         "kind": "phase_handoff_stage",
         "new_current_stage": control.current_stage,
         "new_monitored_stage": stage_state["monitored_stage"],
+        "removed_parts": removed_parts,
+        "added_parts": added_parts,
+        "propulsion_snapshot": snapshot,
     })
+    return True
+
+
+def ignite_next_stage_if_needed(vessel, stage_state, verbose=False, label="ignite_next_stage"):
+    control = vessel.control
+    if vessel.available_thrust > 1e-3:
+        return False
+    if control.current_stage <= 0:
+        return False
+    before_parts = part_name_counter(vessel)
+    before_stage = control.current_stage
+    control.activate_next_stage()
+    stage_state["last_stage_time"] = time.time()
+    after_parts = part_name_counter(vessel)
+    removed_parts, added_parts = counter_delta(before_parts, after_parts)
+    snapshot = vessel_composition_snapshot(vessel)
+    propulsion = propulsion_snapshot(vessel, ("LiquidFuel", "Oxidizer"), stage_state)
+    stage_state.setdefault("events", []).append({
+        "time": stage_state["last_stage_time"],
+        "kind": "explicit_ignite_next_stage",
+        "stage_before": before_stage,
+        "stage_after": control.current_stage,
+        "removed_parts": removed_parts,
+        "added_parts": added_parts,
+        "snapshot": snapshot,
+        "propulsion_snapshot": propulsion,
+    })
+    if verbose:
+        verbose_log(
+            vessel,
+            label,
+            f"stage_before={before_stage} stage_after={control.current_stage} "
+            f"removed={summarize_counter(removed_parts)} added={summarize_counter(added_parts)} "
+            f"remaining={summarize_counter(snapshot['parts'])} thrust={snapshot['available_thrust']:.1f} "
+            f"mass={snapshot['mass']:.1f} resources={propulsion.get('current_stage_breakdown', {})}",
+        )
     return True
 
 
@@ -504,6 +735,20 @@ def set_turn_pitch(vessel, turn_start_altitude, turn_end_altitude):
         fraction = (altitude - turn_start_altitude) / (turn_end_altitude - turn_start_altitude)
         pitch = 90.0 * (1.0 - fraction)
     vessel.auto_pilot.target_pitch_and_heading(pitch, 90)
+
+
+def set_core_finish_guidance(vessel):
+    apoapsis = vessel.orbit.apoapsis_altitude
+    if apoapsis >= 130_000.0:
+        pitch = 3.0
+    elif apoapsis >= 110_000.0:
+        pitch = 5.0
+    elif apoapsis >= 90_000.0:
+        pitch = 7.0
+    else:
+        pitch = 10.0
+    vessel.auto_pilot.target_pitch_and_heading(pitch, 90)
+    return pitch
 
 
 def desired_rails_warp_for_seconds(seconds_until_event):
@@ -542,11 +787,9 @@ def desired_rails_warp_for_phase_error(error_deg):
     if error_deg > 25:
         return 5
     if error_deg > 10:
-        return 4
-    if error_deg > 3:
         return 3
-    if error_deg > 1:
-        return 2
+    if error_deg > 5:
+        return 1
     return 0
 
 
@@ -584,7 +827,6 @@ def fly_standard_ascent(
     verbose=False,
 ):
     body = vessel.orbit.body
-    mu = body.gravitational_parameter
     stage_propellants = infer_stage_propellants(rocket_dict, parts_by_name)
     propellants = monitored_propellants(stage_propellants)
     stage_state = {
@@ -595,8 +837,13 @@ def fly_standard_ascent(
     diagnostics = {
         "designed_stage_propellants": {str(k): list(v) for k, v in stage_propellants.items()},
     }
-    handoff_periapsis_min = max(target_periapsis * 0.5, 30_000.0)
-    handoff_remaining_max = handoff_fuel_threshold * 2.0
+    core_finish_start_apoapsis = target_apoapsis * 0.9
+    preferred_handoff_periapsis_min = -50_000.0
+    preferred_handoff_periapsis_max = 10_000.0
+    preferred_handoff_apoapsis_min = 90_000.0
+    preferred_handoff_apoapsis_max = 120_000.0
+    safety_handoff_apoapsis = 140_000.0
+    safety_handoff_periapsis_floor = -100_000.0
 
     control = vessel.control
     ap = vessel.auto_pilot
@@ -619,16 +866,53 @@ def fly_standard_ascent(
         max(control.current_stage, max(stage_propellants.keys(), default=0)),
     )
     diagnostics["initial_stage_resources"] = initial_resources
+    diagnostics["initial_vessel_resources"] = vessel_resource_breakdown(vessel, propellants)
     if verbose:
         print("initial stage resources:", initial_resources)
+        print("initial vessel resources:", diagnostics["initial_vessel_resources"])
 
+    phase = "liftoff_ascent"
+    stage_state.setdefault("events", []).append({
+        "time": time.time(),
+        "kind": "phase_enter",
+        "phase": phase,
+    })
     handed_off = False
+    log_cache = {}
     while True:
-        set_turn_pitch(vessel, turn_start_altitude, turn_end_altitude)
-
         altitude = vessel.flight().mean_altitude
         apoapsis = vessel.orbit.apoapsis_altitude
         periapsis = vessel.orbit.periapsis_altitude
+        if phase == "liftoff_ascent":
+            set_turn_pitch(vessel, turn_start_altitude, turn_end_altitude)
+            control.throttle = 1.0
+            if apoapsis >= core_finish_start_apoapsis:
+                phase = "core_stage_finish"
+                stage_state.setdefault("events", []).append({
+                    "time": time.time(),
+                    "kind": "phase_enter",
+                    "phase": phase,
+                    "altitude": altitude,
+                    "apoapsis": apoapsis,
+                    "periapsis": periapsis,
+                })
+                if verbose:
+                    verbose_log(
+                        vessel,
+                        "phase_change",
+                        f"phase change -> {phase} alt={altitude:.0f} apo={apoapsis:.0f} "
+                        f"peri={periapsis:.0f}",
+                    )
+
+        if phase == "core_stage_finish":
+            set_core_finish_guidance(vessel)
+            if apoapsis >= 110_000.0:
+                control.throttle = 0.05
+            elif apoapsis >= 90_000.0:
+                control.throttle = 0.20
+            else:
+                control.throttle = 0.50
+
         if periapsis_cutoff is not None and periapsis >= periapsis_cutoff:
             if verbose:
                 print(
@@ -646,10 +930,6 @@ def fly_standard_ascent(
                 "monitored_stage": stage_state["monitored_stage"],
             })
             break
-        if apoapsis > target_apoapsis * 0.9:
-            control.throttle = min(control.throttle, 0.25)
-        if apoapsis > target_apoapsis * 0.98:
-            control.throttle = min(control.throttle, 0.10)
 
         current_pitch = ap.target_pitch
         staged = maybe_stage(vessel, propellants, stage_state)
@@ -670,27 +950,63 @@ def fly_standard_ascent(
         if stage_state["monitored_stage"] is not None:
             remaining = stage_resource_amount(vessel, stage_state["monitored_stage"], propellants)
 
+        near_empty = (
+            remaining is not None
+            and remaining <= handoff_fuel_threshold
+        )
+        in_preferred_handoff_window = (
+            preferred_handoff_periapsis_min <= periapsis <= preferred_handoff_periapsis_max
+            and preferred_handoff_apoapsis_min <= apoapsis <= preferred_handoff_apoapsis_max
+        )
+        in_safety_handoff_region = (
+            apoapsis >= safety_handoff_apoapsis
+            and periapsis >= safety_handoff_periapsis_floor
+        )
         should_handoff = (
-            altitude >= handoff_altitude
+            phase == "core_stage_finish"
+            and altitude >= handoff_altitude
             and control.current_stage > 0
-            and apoapsis >= target_apoapsis
-            and periapsis >= handoff_periapsis_min
-            and remaining is not None
-            and remaining <= handoff_remaining_max
+            and (in_preferred_handoff_window or near_empty or in_safety_handoff_region)
         )
         if should_handoff:
+            if in_preferred_handoff_window:
+                handoff_reason = "preferred_window"
+            elif near_empty:
+                handoff_reason = "fuel_near_empty"
+            else:
+                handoff_reason = "safety_window"
             if verbose:
-                print(
+                verbose_log(
+                    vessel,
+                    "handoff",
                     f"handoff gate reached alt={altitude:.0f} apo={apoapsis:.0f} "
-                    f"peri={periapsis:.0f} remaining={remaining:.1f} "
-                    f"handoff_peri_min={handoff_periapsis_min:.0f} "
-                    f"handoff_remaining_max={handoff_remaining_max:.1f}; "
-                    "handing off to the next phase/stage"
+                    f"peri={periapsis:.0f} remaining={remaining} "
+                    f"reason={handoff_reason}; handing off to the next phase/stage",
                 )
             control.throttle = 0.0
             if stage_state["monitored_stage"] is not None and vessel.control.current_stage > 0:
+                stage_state.setdefault("events", []).append({
+                    "time": time.time(),
+                    "kind": "phase_handoff_trigger",
+                    "reason": handoff_reason,
+                    "altitude": altitude,
+                    "apoapsis": apoapsis,
+                    "periapsis": periapsis,
+                    "remaining": remaining,
+                    "current_stage": control.current_stage,
+                    "monitored_stage": stage_state["monitored_stage"],
+                })
                 handoff_to_upper_stage(vessel, stage_state, propellants)
                 time.sleep(1.0)
+                phase = "coast_to_apoapsis"
+                stage_state.setdefault("events", []).append({
+                    "time": time.time(),
+                    "kind": "phase_enter",
+                    "phase": phase,
+                    "altitude": vessel.flight().mean_altitude,
+                    "apoapsis": vessel.orbit.apoapsis_altitude,
+                    "periapsis": vessel.orbit.periapsis_altitude,
+                })
                 stable = stabilize_vehicle(
                     vessel,
                     ap,
@@ -706,22 +1022,43 @@ def fly_standard_ascent(
                     "target_pitch": 0.0,
                 })
                 if verbose:
-                    print(
+                    handoff_event = stage_state["events"][-2] if len(stage_state["events"]) >= 2 else {}
+                    snapshot = vessel_composition_snapshot(vessel)
+                    propulsion = propulsion_snapshot(vessel, propellants, stage_state)
+                    verbose_log(
+                        vessel,
+                        "phase_handoff",
                         f"phase_handoff: post-stage current_stage={control.current_stage} "
                         f"angular_speed={angular_speed(vessel):.3f} "
                         f"apo={vessel.orbit.apoapsis_altitude:.0f} "
                         f"peri={vessel.orbit.periapsis_altitude:.0f} "
-                        f"throttle={control.throttle:.2f}"
+                        f"throttle={control.throttle:.2f} "
+                        f"removed={summarize_counter(handoff_event.get('removed_parts', {}))} "
+                        f"remaining={summarize_counter(snapshot['parts'])} "
+                        f"resources={propulsion.get('current_stage_breakdown', {})} "
+                        f"engines={propulsion.get('engine_runtime', [])}",
                     )
             handed_off = True
             break
 
         if verbose:
-            print(
+            ascent_band = (
+                phase,
+                int(apoapsis // 10_000),
+                int(periapsis // 10_000),
+                control.current_stage,
+                round(control.throttle, 2),
+            )
+            verbose_log_change(
+                vessel,
+                log_cache,
+                "ascent_status",
+                ascent_band,
+                "ascent",
                 f"ascent alt={altitude:8.0f}m apo={apoapsis:8.0f}m peri={periapsis:8.0f}m "
-                f"pitch={vessel.auto_pilot.target_pitch:5.1f} "
+                f"phase={phase:>17s} pitch={vessel.auto_pilot.target_pitch:5.1f} "
                 f"stage={control.current_stage} fuel_stage={stage_state['monitored_stage']} "
-                f"fuel={remaining}"
+                f"fuel={remaining} throttle={control.throttle:.2f}",
             )
         time.sleep(0.1)
     control.throttle = 0.0
@@ -729,6 +1066,7 @@ def fly_standard_ascent(
     if handed_off:
         missed_apoapsis = False
         prev_time_to_apoapsis = None
+        coast_log_cache = {}
         while vessel.orbit.time_to_apoapsis > 20:
             hold_orbital_insertion_guidance(vessel, ap)
             maybe_stage(vessel, propellants, stage_state)
@@ -748,10 +1086,12 @@ def fly_standard_ascent(
                     "periapsis": vessel.orbit.periapsis_altitude,
                 })
                 if verbose:
-                    print(
+                    verbose_log(
+                        vessel,
+                        "coast",
                         f"coast missed apoapsis previous_ttAp={prev_time_to_apoapsis:.1f}s "
                         f"ttAp={time_to_apoapsis:.1f}s apo={vessel.orbit.apoapsis_altitude:.0f} "
-                        f"peri={vessel.orbit.periapsis_altitude:.0f}"
+                        f"peri={vessel.orbit.periapsis_altitude:.0f}",
                     )
                 break
             if sc is not None:
@@ -762,11 +1102,22 @@ def fly_standard_ascent(
                     label="coast_warp",
                 )
             if verbose:
-                print(
+                coast_band = (
+                    int(vessel.orbit.apoapsis_altitude // 10_000),
+                    int(vessel.orbit.periapsis_altitude // 10_000),
+                    int(time_to_apoapsis // 60),
+                    control.current_stage,
+                )
+                verbose_log_change(
+                    vessel,
+                    coast_log_cache,
+                    "coast_status",
+                    coast_band,
+                    "coast",
                     f"coast apo={vessel.orbit.apoapsis_altitude:8.0f}m "
                     f"peri={vessel.orbit.periapsis_altitude:8.0f}m "
                     f"ttAp={time_to_apoapsis:6.1f}s "
-                    f"stage={control.current_stage}"
+                    f"stage={control.current_stage}",
                 )
             prev_time_to_apoapsis = time_to_apoapsis
             time.sleep(0.5)
@@ -774,13 +1125,36 @@ def fly_standard_ascent(
             clear_rails_warp(sc, verbose=verbose, label="coast_warp")
 
         if not missed_apoapsis:
+            phase = "orbital_insertion"
+            stage_state.setdefault("events", []).append({
+                "time": time.time(),
+                "kind": "phase_enter",
+                "phase": phase,
+                "apoapsis": vessel.orbit.apoapsis_altitude,
+                "periapsis": vessel.orbit.periapsis_altitude,
+                "time_to_apoapsis": vessel.orbit.time_to_apoapsis,
+            })
             hold_orbital_insertion_guidance(vessel, ap, verbose=verbose, label="orbital_insertion")
+            if verbose:
+                verbose_log(
+                    vessel,
+                    "orbital_insertion_setup",
+                    f"snapshot={vessel_composition_snapshot(vessel)} "
+                    f"propulsion={propulsion_snapshot(vessel, propellants, stage_state)}",
+                )
+            ignite_next_stage_if_needed(
+                vessel,
+                stage_state,
+                verbose=verbose,
+                label="orbital_insertion_ignite",
+            )
             insertion_start = time.time()
             control.throttle = 1.0
+            insertion_log_cache = {}
             while vessel.orbit.periapsis_altitude < target_periapsis:
                 hold_orbital_insertion_guidance(vessel, ap)
                 maybe_stage(vessel, propellants, stage_state)
-                if vessel.available_thrust < 1e-3:
+                if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
                     stage_with_stability(
                         vessel,
                         ap,
@@ -794,10 +1168,22 @@ def fly_standard_ascent(
                 periapsis = vessel.orbit.periapsis_altitude
                 apoapsis = vessel.orbit.apoapsis_altitude
                 if verbose:
-                    print(
+                    insertion_band = (
+                        int(periapsis // 10_000),
+                        int(apoapsis // 10_000),
+                        int(vessel.orbit.time_to_apoapsis // 10),
+                        control.current_stage,
+                        round(control.throttle, 2),
+                    )
+                    verbose_log_change(
+                        vessel,
+                        insertion_log_cache,
+                        "insertion_status",
+                        insertion_band,
+                        "insertion",
                         f"insertion peri={periapsis:8.0f}m apo={apoapsis:8.0f}m "
                         f"ttAp={vessel.orbit.time_to_apoapsis:6.1f}s "
-                        f"stage={control.current_stage} throttle={control.throttle:.2f}"
+                        f"stage={control.current_stage} throttle={control.throttle:.2f}",
                     )
                 if vessel.orbit.time_to_apoapsis < -5:
                     break
@@ -836,6 +1222,9 @@ def wait_for_transfer_window(
     timeout=7200.0,
 ):
     start = time.time()
+    log_cache = {}
+    previous_error = None
+    previous_error_deg = None
     while time.time() - start < timeout:
         current_phase = phase_angle(vessel, target_body, central_body)
         error = normalize_angle(current_phase - required_phase)
@@ -848,11 +1237,21 @@ def wait_for_transfer_window(
                 label="transfer_window_warp",
             )
         if verbose:
-            print(
+            phase_band = (
+                round(error_deg),
+                -1 if error < 0 else 1,
+                sc.rails_warp_factor if sc is not None else 0,
+            )
+            verbose_log_change(
+                vessel,
+                log_cache,
+                "transfer_window",
+                phase_band,
+                "transfer_window",
                 f"transfer_window target={target_body.name} "
                 f"phase={math.degrees(current_phase):6.2f}deg "
                 f"required={math.degrees(required_phase):6.2f}deg "
-                f"error={math.degrees(error):6.2f}deg"
+                f"error={math.degrees(error):6.2f}deg",
             )
         if abs(error) <= tolerance_rad:
             if sc is not None:
@@ -861,7 +1260,28 @@ def wait_for_transfer_window(
                 "phase_deg": math.degrees(current_phase),
                 "required_phase_deg": math.degrees(required_phase),
                 "error_deg": math.degrees(error),
+                "window_capture": "within_tolerance",
             }
+        crossed_window = (
+            previous_error is not None
+            and error * previous_error < 0.0
+            and previous_error_deg is not None
+            and min(error_deg, previous_error_deg) <= max(15.0, math.degrees(tolerance_rad) * 2.0)
+        )
+        if crossed_window:
+            if sc is not None:
+                clear_rails_warp(sc, verbose=verbose, label="transfer_window_warp")
+            chosen_error = error if error_deg <= previous_error_deg else previous_error
+            return {
+                "phase_deg": math.degrees(current_phase),
+                "required_phase_deg": math.degrees(required_phase),
+                "error_deg": math.degrees(chosen_error),
+                "window_capture": "crossed_window",
+                "previous_error_deg": math.degrees(previous_error),
+                "current_error_deg": math.degrees(error),
+            }
+        previous_error = error
+        previous_error_deg = error_deg
         time.sleep(2.0)
     if sc is not None:
         clear_rails_warp(sc, verbose=verbose, label="transfer_window_warp")
@@ -880,12 +1300,17 @@ def burn_until_apoapsis(
 ):
     control = vessel.control
     start = time.time()
+    log_cache = {}
+    start_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
+    no_actual_thrust_start = None
     set_orbital_insertion_attitude(vessel, ap, verbose=verbose, label=label)
+    if verbose:
+        verbose_log(vessel, label, f"start_snapshot={start_snapshot}")
     control.throttle = 1.0
     while vessel.orbit.apoapsis_altitude < target_apoapsis:
         hold_orbital_insertion_guidance(vessel, ap)
         maybe_stage(vessel, propellants, stage_state)
-        if vessel.available_thrust < 1e-3:
+        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
             stage_with_stability(
                 vessel,
                 ap,
@@ -896,27 +1321,80 @@ def burn_until_apoapsis(
                 label=f"{label}_stage",
                 post_stage_mode="orbit_target",
             )
+        elif vessel.available_thrust < 1e-3:
+            control.throttle = 0.0
+            failure_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
+            if verbose:
+                verbose_log(vessel, label, f"no thrust available snapshot={failure_snapshot}")
+            return {
+                "ok": False,
+                "reason": "no_thrust_available",
+                "start_snapshot": start_snapshot,
+                "failure_snapshot": failure_snapshot,
+            }
         apoapsis = vessel.orbit.apoapsis_altitude
+        actual_thrust = vessel.thrust
+        fuel_breakdown = vessel_resource_breakdown(vessel, propellants)
         if verbose:
-            print(
+            burn_band = (
+                int(apoapsis // 100_000),
+                control.current_stage,
+                round(control.throttle, 2),
+                int(vessel.available_thrust > 1e-3),
+                int(actual_thrust > 1e-3),
+            )
+            verbose_log_change(
+                vessel,
+                log_cache,
+                "burn_status",
+                burn_band,
+                label,
                 f"{label} apo={apoapsis:8.0f}m "
                 f"target={target_apoapsis:8.0f}m stage={control.current_stage} "
-                f"throttle={control.throttle:.2f}"
+                f"throttle={control.throttle:.2f} available_thrust={vessel.available_thrust:.1f} "
+                f"actual_thrust={actual_thrust:.1f} resources={fuel_breakdown}",
             )
+        if control.throttle > 0.5 and vessel.available_thrust > 1e-3 and actual_thrust < 1e-3:
+            if no_actual_thrust_start is None:
+                no_actual_thrust_start = time.time()
+            elif time.time() - no_actual_thrust_start > 5.0:
+                control.throttle = 0.0
+                failure_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
+                if verbose:
+                    verbose_log(vessel, label, f"no actual thrust snapshot={failure_snapshot}")
+                return {
+                    "ok": False,
+                    "reason": "no_actual_thrust",
+                    "start_snapshot": start_snapshot,
+                    "failure_snapshot": failure_snapshot,
+                }
+        else:
+            no_actual_thrust_start = None
         if time.time() - start > timeout:
             control.throttle = 0.0
-            return False
+            return {
+                "ok": False,
+                "reason": "timeout",
+                "start_snapshot": start_snapshot,
+                "failure_snapshot": propulsion_snapshot(vessel, propellants, stage_state),
+            }
         if apoapsis > target_apoapsis * 0.9:
             control.throttle = 0.25
         if apoapsis > target_apoapsis * 0.98:
             control.throttle = 0.1
         time.sleep(0.1)
     control.throttle = 0.0
-    return True
+    return {
+        "ok": True,
+        "reason": "target_reached",
+        "start_snapshot": start_snapshot,
+        "final_snapshot": propulsion_snapshot(vessel, propellants, stage_state),
+    }
 
 
 def wait_for_body_change(sc, vessel, body_name, verbose=False, timeout=21600.0):
     start = time.time()
+    log_cache = {}
     while time.time() - start < timeout:
         current_name = vessel.orbit.body.name
         if sc is not None:
@@ -928,9 +1406,19 @@ def wait_for_body_change(sc, vessel, body_name, verbose=False, timeout=21600.0):
                 label="soi_coast_warp",
             )
         if verbose:
-            print(
+            coast_band = (
+                current_name,
+                sc.rails_warp_factor if sc is not None else 0,
+                int(vessel.orbit.time_to_soi_change // 60) if vessel.orbit.time_to_soi_change > 0 else 0,
+            )
+            verbose_log_change(
+                vessel,
+                log_cache,
+                "soi_coast",
+                coast_band,
+                "coast_to_soi",
                 f"coast_to_soi current_body={current_name} "
-                f"apo={vessel.orbit.apoapsis_altitude:.0f} peri={vessel.orbit.periapsis_altitude:.0f}"
+                f"apo={vessel.orbit.apoapsis_altitude:.0f} peri={vessel.orbit.periapsis_altitude:.0f}",
             )
         if current_name == body_name:
             if sc is not None:
@@ -955,6 +1443,7 @@ def capture_at_body(
 ):
     control = vessel.control
     start = time.time()
+    log_cache = {}
     while vessel.orbit.body.name == body_name and vessel.orbit.time_to_periapsis > 30:
         if sc is not None:
             set_rails_warp(
@@ -964,10 +1453,20 @@ def capture_at_body(
                 label="capture_coast_warp",
             )
         if verbose:
-            print(
+            coast_band = (
+                int(vessel.orbit.periapsis_altitude // 10_000),
+                int(vessel.orbit.apoapsis_altitude // 10_000),
+                int(vessel.orbit.time_to_periapsis // 60),
+            )
+            verbose_log_change(
+                vessel,
+                log_cache,
+                "capture_coast",
+                coast_band,
+                "mun_coast",
                 f"mun_coast peri={vessel.orbit.periapsis_altitude:8.0f}m "
                 f"apo={vessel.orbit.apoapsis_altitude:8.0f}m "
-                f"ttPe={vessel.orbit.time_to_periapsis:6.1f}s"
+                f"ttPe={vessel.orbit.time_to_periapsis:6.1f}s",
             )
         time.sleep(1.0)
     if sc is not None:
@@ -976,10 +1475,11 @@ def capture_at_body(
     hold_retrograde_guidance(vessel, ap, verbose=verbose, label="mun_capture")
     control.throttle = 1.0
     target_apoapsis = vessel.orbit.body.equatorial_radius + target_apoapsis_altitude
+    capture_log_cache = {}
     while time.time() - start < timeout:
         hold_retrograde_guidance(vessel, ap)
         maybe_stage(vessel, propellants, stage_state)
-        if vessel.available_thrust < 1e-3:
+        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
             stage_with_stability(
                 vessel,
                 ap,
@@ -996,10 +1496,22 @@ def capture_at_body(
         apoapsis_altitude = vessel.orbit.apoapsis_altitude
         periapsis_altitude = vessel.orbit.periapsis_altitude
         if verbose:
-            print(
+            capture_band = (
+                round(eccentricity, 2),
+                int(apoapsis_altitude // 10_000),
+                int(periapsis_altitude // 10_000),
+                control.current_stage,
+                round(control.throttle, 2),
+            )
+            verbose_log_change(
+                vessel,
+                capture_log_cache,
+                "mun_capture",
+                capture_band,
+                "mun_capture",
                 f"mun_capture ecc={eccentricity:6.3f} apo={apoapsis_altitude:8.0f}m "
                 f"peri={periapsis_altitude:8.0f}m ttPe={vessel.orbit.time_to_periapsis:6.1f}s "
-                f"stage={control.current_stage} throttle={control.throttle:.2f}"
+                f"stage={control.current_stage} throttle={control.throttle:.2f}",
             )
         if eccentricity < 1.0 and apoapsis <= target_apoapsis:
             control.throttle = 0.0
@@ -1084,9 +1596,28 @@ def fly_mun_mission(
         "kind": "mun_transfer_window",
         **window,
     })
+    transfer_start_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
+    result["transfer_start_snapshot"] = transfer_start_snapshot
+    if verbose:
+        verbose_log(vessel, "mun_transfer_setup", f"snapshot={transfer_start_snapshot}")
+        verbose_log(
+            vessel,
+            "mun_transfer_vehicle",
+            f"snapshot={vessel_composition_snapshot(vessel)}",
+        )
+    ignite_next_stage_if_needed(
+        vessel,
+        stage_state,
+        verbose=verbose,
+        label="mun_transfer_ignite",
+    )
+    transfer_start_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
+    result["transfer_start_snapshot"] = transfer_start_snapshot
+    if verbose:
+        verbose_log(vessel, "mun_transfer_setup_post_ignite", f"snapshot={transfer_start_snapshot}")
 
     transfer_apoapsis = r2 - kerbin.equatorial_radius
-    transfer_ok = burn_until_apoapsis(
+    transfer_result = burn_until_apoapsis(
         vessel,
         vessel.auto_pilot,
         stage_state,
@@ -1095,8 +1626,9 @@ def fly_mun_mission(
         verbose=verbose,
         label="mun_transfer_burn",
     )
-    if not transfer_ok:
-        result["mission_phase"] = "mun_transfer_burn_timeout"
+    result["mun_transfer_burn"] = transfer_result
+    if not transfer_result["ok"]:
+        result["mission_phase"] = f"mun_transfer_burn_{transfer_result['reason']}"
         result["stage_events"] = stage_state["events"]
         return result
 
