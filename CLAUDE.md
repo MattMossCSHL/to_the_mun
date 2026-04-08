@@ -30,19 +30,19 @@ read `ksp_project_agent_brief.md` for full context. read the latest file in `llm
 ## project architecture (pipeline)
 
 ```
-design generator          ← DONE (GA complete)
+design generator               ← DONE (GA complete)
     ↓
-structure validator       ← DONE (Goal 0)
+structure validator            ← DONE (Goal 0)
     ↓
-analytic filters          ← DONE (TWR, delta-v, burn time)
+analytic filters               ← DONE (TWR, delta-v, burn time)
     ↓
-CoM/CoL stability filter  ← deferred (needed before KSP harness is useful)
+craft serialization            ← IN PLACE (`src/craft.py`, prototype but usable)
     ↓
-surrogate simulator       ← not started
+top candidates → KSP runner    ← IN ACTIVE DEVELOPMENT (`scripts/run_saved_rocket.py`)
     ↓
-top candidates → ksp harness   ← not started (kRPC research upcoming)
+mission telemetry / run logs   ← IN PLACE (`results/ksp_runs/`)
     ↓
-dataset → model training
+surrogate simulator / dataset / model training ← not started
 ```
 
 KSP is slow. treat it as the expensive ground-truth oracle, not the primary training loop.
@@ -77,10 +77,14 @@ KSP is slow. treat it as the expensive ground-truth oracle, not the primary trai
 | `src/plots.py` | `plot_run` — visualise GA run with outlier clipping |
 | `src/config.py` | `load_part_lists` → `(pods, tanks, engines, decouplers)` |
 | `src/rocket.py` | `Rocket` class — TODO: add `from_dict()` classmethod |
+| `src/craft.py` | linear-stack `.craft` serializer extracted from notebook research |
 | `scripts/scrape_ksp_parts.py` | CLI to regenerate parts library from KSP install |
 | `scripts/check_rocket_structure.py` | CLI to validate a rocket JSON |
+| `scripts/filter_rocket.py` | CLI to score/filter a saved rocket JSON with analytic filters |
+| `scripts/generate_rocket.py` | CLI to generate a random rocket from the current part lists |
 | `scripts/run_ga.py` | CLI to run the GA |
 | `scripts/plot_run.py` | CLI to plot a saved GA run |
+| `scripts/run_saved_rocket.py` | generate/write/fly a saved rocket through the live KSP mission runner |
 | `notebooks/building_the_parser.ipynb` | parser walkthrough (complete) |
 | `notebooks/structural_validator.ipynb` | validator walkthrough (complete) |
 | `notebooks/analytic_filters.ipynb` | filters walkthrough (complete) |
@@ -111,11 +115,25 @@ KSP is slow. treat it as the expensive ground-truth oracle, not the primary trai
 
 ## current status
 
-Goals 0 and 1 analytic filters are complete. The GA (`src/genetic_algorithm.py`) is fully built, tested, and extracted. `notebooks/design_generator.ipynb` is the complete walkthrough.
+The earlier analytic/GA phase is complete, and the project has already moved into live KSP execution.
 
-**upcoming work (in rough order):**
-1. Atmospheric delta-v model — detect air-breathing engines, cap their contribution at operational ceiling (~25 km). New cell in `analytic_filters.ipynb`, extract to `src/filters.py`. See `llm_docs/design_decisions.md` for full rationale.
-2. `to_craft()` — convert rocket dict to KSP `.craft` file format. Requires researching minimal `.craft` structure and placing parts in 3D space along vertical axis. Unlocks CoM/CoL filter.
-3. `Rocket.from_dict()` classmethod in `src/rocket.py`
-4. Progressive complexity — grow `max_stages` when top-K average dv crosses a threshold. See `design_decisions.md`.
-5. kRPC research — understand how to automate KSP staging/steering for the simulation oracle
+Current reality:
+
+- Goals 0 and 1 analytic filters are complete.
+- The GA (`src/genetic_algorithm.py`) is fully built, tested, and extracted.
+- `.craft` generation exists in `src/craft.py` and is already being used by the live runner.
+- `scripts/run_saved_rocket.py` now writes craft files, loads them into a KSP save, runs a mission, and records run artifacts under `results/ksp_runs/`.
+- The mission can now reach Kerbin orbit and survive into the Mun-transfer phase.
+
+The active blocker from the latest handoff/session notes is narrow and runtime-specific:
+
+- the surviving Terrier upper stage is present
+- it still has `LiquidFuel` / `Oxidizer`
+- it reports nonzero `available_thrust`
+- but it produces `actual_thrust = 0.0` during the Mun transfer burn
+
+**next work should prioritize:**
+1. Diagnose engine runtime behavior in `scripts/run_saved_rocket.py` during upper-stage transfer burn.
+2. Verify whether a more direct engine activation / throttle path is needed through kRPC.
+3. Only after that, return to parking-orbit efficiency / mission-tuning cleanup.
+4. Keep deferred infrastructure items in view: CoM/CoL filter, surrogate simulator, dataset-building, and training.

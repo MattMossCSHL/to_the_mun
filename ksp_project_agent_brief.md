@@ -66,6 +66,35 @@ the core principle is:
 
 ---
 
+## current project state
+
+the original plan below is still the right architectural direction, but the repo has already advanced beyond the early "research / not started" stage for ksp integration.
+
+as of the latest handoff and session notes:
+
+- the parser, structural validator, analytic filters, and GA are all built
+- a `.craft` serializer exists in `src/craft.py`
+- a live ksp runner exists in `scripts/run_saved_rocket.py`
+- the runner can already:
+  - take a saved rocket candidate
+  - write a `.craft`
+  - place it into a save
+  - launch and fly a deterministic mission attempt
+  - write run artifacts to `results/ksp_runs/`
+
+the current blocker is no longer "how do we start talking to ksp?"
+
+the current blocker is much narrower:
+
+- the mission can now get as far as kerbin orbit and the mun-transfer phase
+- the surviving terrier upper stage is present and still has propellant
+- ksp reports nonzero `available_thrust`
+- but the engine still shows `actual_thrust = 0.0` during the transfer burn
+
+so the next agent should treat runtime engine-state diagnosis in the live runner as the immediate priority, not restart the serializer or go back to pre-harness research.
+
+---
+
 # PLAN
 
 ## path a: craft-file based pipeline

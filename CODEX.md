@@ -23,10 +23,16 @@ Before doing substantive work in this repo, read:
 
 ## Current Direction
 
-As of the latest recorded notes, the GA pipeline is complete and the next likely work items are:
+As of the latest recorded notes, the project is already past the pure-GA phase:
 
-1. atmospheric delta-v handling for air-breathing engines
-2. `to_craft()` and craft-file generation
-3. `Rocket.from_dict()`
-4. progressive complexity for `max_stages`
-5. kRPC research
+1. the GA / analytic pipeline is complete
+2. `.craft` generation exists in `src/craft.py`
+3. the live KSP runner exists in `scripts/run_saved_rocket.py`
+4. current mission progress reaches Kerbin orbit and the Mun-transfer phase
+5. the active blocker is runtime upper-stage behavior: the surviving Terrier has fuel and nonzero `available_thrust` but still shows `actual_thrust = 0.0` during transfer burn
+
+Near-term focus:
+
+1. inspect and fix upper-stage engine activation / throttle / feed behavior in the runner
+2. only then return to mission-efficiency tuning
+3. keep longer-horizon deferred work in view: CoM/CoL, surrogate sim, dataset, training
