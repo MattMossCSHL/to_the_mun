@@ -242,6 +242,28 @@ def safe_getattr(obj, name, default=None):
         return default
 
 
+def safe_setattr(obj, name, value):
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        return False
+
+
+def safe_call(obj, name, *args, **kwargs):
+    try:
+        method = getattr(obj, name)
+    except Exception:
+        return False
+    if not callable(method):
+        return False
+    try:
+        method(*args, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
 def engine_runtime_snapshot(vessel):
     snapshots = []
     engines = safe_getattr(safe_getattr(vessel, "parts"), "engines", []) or []
@@ -268,6 +290,59 @@ def engine_runtime_snapshot(vessel):
     return snapshots
 
 
+def candidate_burn_engines(vessel):
+    engines = safe_getattr(safe_getattr(vessel, "parts"), "engines", []) or []
+    candidates = []
+    for engine in engines:
+        part = safe_getattr(engine, "part")
+        if safe_getattr(engine, "has_fuel") or (safe_getattr(engine, "available_thrust", 0.0) or 0.0) > 1e-3:
+            candidates.append((engine, part))
+    return candidates
+
+
+def nudge_engines_for_burn(vessel, stage_state, verbose=False, label="engine_nudge"):
+    control = vessel.control
+    actions = []
+    control.throttle = max(control.throttle, 1.0)
+    time.sleep(0.1)
+    for engine, part in candidate_burn_engines(vessel):
+        engine_label = safe_getattr(part, "title", safe_getattr(part, "name", "unknown"))
+        attempted = []
+        if safe_call(engine, "activate"):
+            attempted.append("engine.activate()")
+        if safe_setattr(engine, "active", True):
+            attempted.append("engine.active=True")
+        if part is not None:
+            if safe_call(part, "activate"):
+                attempted.append("part.activate()")
+            if safe_setattr(part, "active", True):
+                attempted.append("part.active=True")
+        if attempted:
+            actions.append({
+                "engine": engine_label,
+                "attempted": attempted,
+                "active": safe_getattr(engine, "active"),
+                "available_thrust": safe_getattr(engine, "available_thrust"),
+                "thrust": safe_getattr(engine, "thrust"),
+                "throttle": safe_getattr(engine, "throttle"),
+                "has_fuel": safe_getattr(engine, "has_fuel"),
+            })
+    if actions:
+        time.sleep(0.2)
+        event = {
+            "time": time.time(),
+            "kind": "runtime_engine_nudge",
+            "label": label,
+            "vessel_throttle": control.throttle,
+            "actions": actions,
+            "propulsion_snapshot": propulsion_snapshot(vessel, ("LiquidFuel", "Oxidizer"), stage_state),
+        }
+        stage_state.setdefault("events", []).append(event)
+        if verbose:
+            verbose_log(vessel, label, f"engine_nudge={event}")
+    return actions
+
+
 def capture_prelaunch_screenshot(run_dir: Path):
     out_path = run_dir / "prelaunch.png"
     subprocess.run(["screencapture", "-x", str(out_path)], check=True)
@@ -289,7 +364,7 @@ def wait_for_active_vessel(sc, timeout=10.0):
 
 
 def project_stage_to_ksp_stage(project_stage: int) -> int:
-    return 0 if project_stage == 0 else 2 * project_stage
+    return 0 if project_stage == 0 else 2 * project_stage - 1
 
 
 def infer_stage_propellants(rocket_dict, parts_by_name):
@@ -311,10 +386,16 @@ def monitored_propellants(stage_propellants):
     return tuple(sorted(names))
 
 
+def propellant_names_for_stage(propellants, ksp_stage):
+    if isinstance(propellants, dict):
+        return propellants.get(ksp_stage, ())
+    return propellants
+
+
 def stage_resource_amount(vessel, ksp_stage, propellants, cumulative=True):
     resources = vessel.resources_in_decouple_stage(ksp_stage, cumulative=cumulative)
     total = 0.0
-    for resource_name in propellants:
+    for resource_name in propellant_names_for_stage(propellants, ksp_stage):
         if resources.has_resource(resource_name):
             total += resources.amount(resource_name)
     return total
@@ -323,7 +404,7 @@ def stage_resource_amount(vessel, ksp_stage, propellants, cumulative=True):
 def stage_resource_breakdown(vessel, ksp_stage, propellants, cumulative=True):
     resources = vessel.resources_in_decouple_stage(ksp_stage, cumulative=cumulative)
     breakdown = {}
-    for resource_name in propellants:
+    for resource_name in propellant_names_for_stage(propellants, ksp_stage):
         breakdown[resource_name] = resources.amount(resource_name) if resources.has_resource(resource_name) else 0.0
     return breakdown
 
@@ -340,6 +421,9 @@ def current_fueled_stage(vessel, propellants, empty_threshold=0.1, max_stage=Non
     control = vessel.control
     max_stage = control.current_stage if max_stage is None else max_stage
     for ksp_stage in range(max_stage, -1, -1):
+        stage_propellants = propellant_names_for_stage(propellants, ksp_stage)
+        if not stage_propellants:
+            continue
         amount = stage_resource_amount(vessel, ksp_stage, propellants)
         if amount > empty_threshold:
             return ksp_stage
@@ -359,14 +443,15 @@ def debug_stage_resources(vessel, propellants, max_stage):
 def maybe_stage(vessel, propellants, state, empty_threshold=0.1, min_stage_gap=0.75):
     control = vessel.control
     now = time.time()
+    stage_propellants = state.get("stage_propellants", propellants)
     monitored_stage = state.get("monitored_stage")
     if monitored_stage is None:
-        monitored_stage = current_fueled_stage(vessel, propellants, empty_threshold)
+        monitored_stage = current_fueled_stage(vessel, stage_propellants, empty_threshold)
         state["monitored_stage"] = monitored_stage
     if monitored_stage is None:
         return False
 
-    remaining = stage_resource_amount(vessel, monitored_stage, propellants)
+    remaining = stage_resource_amount(vessel, monitored_stage, stage_propellants)
     if remaining > empty_threshold:
         return False
     if control.current_stage <= 0:
@@ -377,7 +462,7 @@ def maybe_stage(vessel, propellants, state, empty_threshold=0.1, min_stage_gap=0
     before_parts = part_name_counter(vessel)
     control.activate_next_stage()
     state["last_stage_time"] = now
-    state["monitored_stage"] = current_fueled_stage(vessel, propellants, empty_threshold)
+    state["monitored_stage"] = current_fueled_stage(vessel, stage_propellants, empty_threshold)
     after_parts = part_name_counter(vessel)
     removed_parts, added_parts = counter_delta(before_parts, after_parts)
     snapshot = propulsion_snapshot(vessel, propellants, state, empty_threshold=empty_threshold)
@@ -393,13 +478,14 @@ def maybe_stage(vessel, propellants, state, empty_threshold=0.1, min_stage_gap=0
     return True
 
 
-def has_lower_fueled_stage(vessel, propellants, empty_threshold=0.1):
+def has_lower_fueled_stage(vessel, propellants, stage_state=None, empty_threshold=0.1):
     control = vessel.control
+    stage_propellants = stage_state.get("stage_propellants", propellants) if stage_state is not None else propellants
     if control.current_stage <= 0:
         return False
     next_fueled_stage = current_fueled_stage(
         vessel,
-        propellants,
+        stage_propellants,
         empty_threshold=empty_threshold,
         max_stage=control.current_stage - 1,
     )
@@ -410,9 +496,10 @@ def propulsion_snapshot(vessel, propellants, stage_state, empty_threshold=0.1):
     control = vessel.control
     monitored_stage = stage_state.get("monitored_stage")
     current_stage = control.current_stage
+    stage_propellants = stage_state.get("stage_propellants", propellants)
     lower_fueled_stage = current_fueled_stage(
         vessel,
-        propellants,
+        stage_propellants,
         empty_threshold=empty_threshold,
         max_stage=current_stage,
     )
@@ -665,6 +752,7 @@ def ensure_thrust_available(vessel, stage_state, min_stage_gap=0.75):
 
 def handoff_to_upper_stage(vessel, stage_state, propellants, min_stage_gap=0.75):
     control = vessel.control
+    stage_propellants = stage_state.get("stage_propellants", propellants)
     if control.current_stage <= 0:
         return False
     now = time.time()
@@ -673,7 +761,7 @@ def handoff_to_upper_stage(vessel, stage_state, propellants, min_stage_gap=0.75)
     before_parts = part_name_counter(vessel)
     control.activate_next_stage()
     stage_state["last_stage_time"] = now
-    stage_state["monitored_stage"] = current_fueled_stage(vessel, propellants)
+    stage_state["monitored_stage"] = current_fueled_stage(vessel, stage_propellants)
     after_parts = part_name_counter(vessel)
     removed_parts, added_parts = counter_delta(before_parts, after_parts)
     snapshot = propulsion_snapshot(vessel, propellants, stage_state)
@@ -831,6 +919,7 @@ def fly_standard_ascent(
     propellants = monitored_propellants(stage_propellants)
     stage_state = {
         "monitored_stage": None,
+        "stage_propellants": stage_propellants,
         "last_stage_time": 0.0,
         "events": [],
     }
@@ -856,7 +945,7 @@ def fly_standard_ascent(
     control.activate_next_stage()
     stage_state["last_stage_time"] = time.time()
     time.sleep(0.5)
-    stage_state["monitored_stage"] = current_fueled_stage(vessel, propellants)
+    stage_state["monitored_stage"] = current_fueled_stage(vessel, stage_propellants)
 
     if verbose:
         print(f"designed stage propellants: {stage_propellants}")
@@ -944,11 +1033,11 @@ def fly_standard_ascent(
                 verbose=verbose,
                 label="fuel_empty_stage",
             )
-            stage_state["monitored_stage"] = current_fueled_stage(vessel, propellants)
+            stage_state["monitored_stage"] = current_fueled_stage(vessel, stage_propellants)
 
         remaining = None
         if stage_state["monitored_stage"] is not None:
-            remaining = stage_resource_amount(vessel, stage_state["monitored_stage"], propellants)
+            remaining = stage_resource_amount(vessel, stage_state["monitored_stage"], stage_propellants)
 
         near_empty = (
             remaining is not None
@@ -1154,7 +1243,7 @@ def fly_standard_ascent(
             while vessel.orbit.periapsis_altitude < target_periapsis:
                 hold_orbital_insertion_guidance(vessel, ap)
                 maybe_stage(vessel, propellants, stage_state)
-                if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
+                if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants, stage_state):
                     stage_with_stability(
                         vessel,
                         ap,
@@ -1303,14 +1392,17 @@ def burn_until_apoapsis(
     log_cache = {}
     start_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
     no_actual_thrust_start = None
+    engine_nudge_attempted = False
     set_orbital_insertion_attitude(vessel, ap, verbose=verbose, label=label)
     if verbose:
         verbose_log(vessel, label, f"start_snapshot={start_snapshot}")
     control.throttle = 1.0
+    if nudge_engines_for_burn(vessel, stage_state, verbose=verbose, label=f"{label}_start"):
+        engine_nudge_attempted = True
     while vessel.orbit.apoapsis_altitude < target_apoapsis:
         hold_orbital_insertion_guidance(vessel, ap)
         maybe_stage(vessel, propellants, stage_state)
-        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
+        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants, stage_state):
             stage_with_stability(
                 vessel,
                 ap,
@@ -1357,6 +1449,9 @@ def burn_until_apoapsis(
         if control.throttle > 0.5 and vessel.available_thrust > 1e-3 and actual_thrust < 1e-3:
             if no_actual_thrust_start is None:
                 no_actual_thrust_start = time.time()
+                if not engine_nudge_attempted:
+                    if nudge_engines_for_burn(vessel, stage_state, verbose=verbose, label=f"{label}_retry"):
+                        engine_nudge_attempted = True
             elif time.time() - no_actual_thrust_start > 5.0:
                 control.throttle = 0.0
                 failure_snapshot = propulsion_snapshot(vessel, propellants, stage_state)
@@ -1479,7 +1574,7 @@ def capture_at_body(
     while time.time() - start < timeout:
         hold_retrograde_guidance(vessel, ap)
         maybe_stage(vessel, propellants, stage_state)
-        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants):
+        if vessel.available_thrust < 1e-3 and has_lower_fueled_stage(vessel, propellants, stage_state):
             stage_with_stability(
                 vessel,
                 ap,
@@ -1559,7 +1654,8 @@ def fly_mun_mission(
     stage_propellants = infer_stage_propellants(rocket_dict, parts_by_name)
     propellants = monitored_propellants(stage_propellants)
     stage_state = {
-        "monitored_stage": current_fueled_stage(vessel, propellants),
+        "monitored_stage": current_fueled_stage(vessel, stage_propellants),
+        "stage_propellants": stage_propellants,
         "last_stage_time": 0.0,
         "events": list(result["stage_events"]),
     }

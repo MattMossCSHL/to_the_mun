@@ -3,7 +3,7 @@ plots.py — visualisation utilities for GA run output.
 
 Functions
 ---------
-plot_run : scatter plot of delta-v by generation with median non-zero line and per-gen stats
+plot_run : scatter plot of delta-v by generation with median/best lines and per-gen stats
 """
 
 import glob
@@ -18,8 +18,8 @@ def plot_run(run_dir: str):
     """Plot delta-v by generation for a saved GA run.
 
     Reads all gen_NNN.json files from run_dir. Scatter plots every rocket's
-    score per generation, overlays a median non-zero delta-v line, clips the y-axis at
-    the 99th percentile, and marks outliers with orange triangles.
+    score per generation, overlays median non-zero and best-score delta-v lines,
+    clips the y-axis at the 99th percentile, and marks outliers with orange triangles.
     Per-generation stats (median non-zero, zeros, invalid) are annotated above the plot.
 
     Parameters
@@ -68,7 +68,10 @@ def plot_run(run_dir: str):
                        marker='^', color='orange', s=30, zorder=5,
                        label='outlier (clipped)' if gen == generations[0] else '')
 
+    clipped_max_scores = [min(score, y_cap) for score in max_scores]
+
     ax.plot(generations, median_nonzeros, color='tomato', linewidth=2, label='median non-zero delta-v')
+    ax.plot(generations, clipped_max_scores, color='blue', linestyle=':', linewidth=2, label='best score')
     ax.set_ylim(0, y_cap * 1.15)
 
     for gen, median_nz, max_score, nz, ni in zip(generations, median_nonzeros, max_scores, n_zeros, n_invalid):

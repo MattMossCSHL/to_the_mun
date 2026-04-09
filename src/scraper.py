@@ -375,6 +375,55 @@ def extract_nodes(part_block):
     return nodes
 
 
+def extract_vector3(value):
+    """Parse a cfg vector string like '0.0, 1.2, 0.0' into a 3-float list."""
+    if value is None:
+        return None
+    parts = [clean_value(piece).strip() for piece in str(value).split(',')]
+    if len(parts) != 3:
+        return None
+    try:
+        return [float(part) for part in parts]
+    except ValueError:
+        return None
+
+
+def extract_bulkhead_profiles(part_block):
+    """Return bulkhead profile labels declared by the part, if any."""
+    raw = part_block.get('bulkheadProfiles')
+    if raw is None:
+        return None
+    profiles = [clean_value(piece).strip() for piece in str(raw).split(',')]
+    profiles = [profile for profile in profiles if profile]
+    return profiles or None
+
+
+def extract_drag_data(part_block):
+    """Extract simple drag-model metadata from a parsed PART block."""
+    keys = ('dragModelType', 'maximum_drag', 'minimum_drag', 'angularDrag')
+    if not any(key in part_block for key in keys):
+        return None
+
+    drag = {}
+    if 'dragModelType' in part_block:
+        drag['model_type'] = clean_value(part_block['dragModelType'])
+    for source_key, target_key in (
+        ('maximum_drag', 'maximum'),
+        ('minimum_drag', 'minimum'),
+        ('angularDrag', 'angular'),
+    ):
+        if source_key in part_block:
+            drag[target_key] = float(clean_value(part_block[source_key]))
+    return drag or None
+
+
+def is_stack_safe_part(part_block):
+    """Return whether a part is safe for the current simple inline stack search space."""
+    lowered = str(part_block.get('name', '')).lower()
+    stack_unsafe_tokens = ('mk2', 'mk3', 'mark2', 'mark3')
+    return not any(token in lowered for token in stack_unsafe_tokens)
+
+
 def extract_part(part_block):
     """
     Extract all design-relevant fields from a parsed PART block.
@@ -401,11 +450,22 @@ def extract_part(part_block):
             'attach_rules'    : str   — raw attachRules flags from cfg
             'nodes'           : dict  — attachment nodes (see extract_nodes)
             'is_command'      : bool  — True if part has a ModuleCommand module
+            'stack_safe'      : bool  — True if the part is allowed in the simple inline stack search space
+            'crew_capacity'   : int   — number of kerbals the part can hold
+            'bulkhead_profiles': list[str] or None — declared bulkhead/profile classes
+            'com_offset'      : list[float] or None — cfg CoM offset vector
+            'cop_offset'      : list[float] or None — cfg CoP offset vector
+            'col_offset'      : list[float] or None — cfg CoL offset vector
+            'drag'            : dict or None — simple drag-model metadata
+            'breaking_force'  : float or None — cfg break-force limit
+            'breaking_torque' : float or None — cfg break-torque limit
+            'vessel_type'     : str or None — cfg vesselType hint when present
             'engine'          : dict or None — engine data (see extract_engine)
             'resources'       : dict or None — resource storage (see extract_tank)
     """
     raw_category = clean_value(part_block.get('category', ''))
     has_command = get_module(part_block, 'ModuleCommand') is not None
+    crew_capacity = int(clean_value(part_block.get('CrewCapacity', '0')) or 0)
 
     return {
         'name': part_block.get('name', ''),
@@ -417,6 +477,20 @@ def extract_part(part_block):
         'attach_rules': clean_value(part_block.get('attachRules', '')),
         'nodes': extract_nodes(part_block),
         'is_command': has_command,
+        'stack_safe': is_stack_safe_part(part_block),
+        'crew_capacity': crew_capacity,
+        'bulkhead_profiles': extract_bulkhead_profiles(part_block),
+        'com_offset': extract_vector3(part_block.get('CoMOffset')),
+        'cop_offset': extract_vector3(part_block.get('CoPOffset')),
+        'col_offset': extract_vector3(part_block.get('CoLOffset')),
+        'drag': extract_drag_data(part_block),
+        'breaking_force': (
+            float(clean_value(part_block['breakingForce'])) if 'breakingForce' in part_block else None
+        ),
+        'breaking_torque': (
+            float(clean_value(part_block['breakingTorque'])) if 'breakingTorque' in part_block else None
+        ),
+        'vessel_type': clean_value(part_block['vesselType']) if 'vesselType' in part_block else None,
         'engine': extract_engine(part_block),
         'resources': extract_tank(part_block),
     }

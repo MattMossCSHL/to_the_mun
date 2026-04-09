@@ -73,7 +73,7 @@ def load_resource_lookup(path=RESOURCES_CFG_PATH):
 
 
 def load_part_lists(parts_by_name):
-    """Split parts_by_name into pods, tanks, and engines by part type.
+    """Split parts_by_name into crewed pods, tanks, engines, and decouplers.
 
     Parameters
     ----------
@@ -84,13 +84,53 @@ def load_part_lists(parts_by_name):
     -------
     tuple
         (pods, tanks, engines, decouplers) — each a list of part name strings.
+        `pods` contains only crew-capable command parts, not probe cores.
     """
-    stack_unsafe_tokens = ("mk2", "mk3")
     tank_propellants = {"LiquidFuel", "Oxidizer", "SolidFuel", "XenonGas"}
+    supported_engine_propellants = {"LiquidFuel", "Oxidizer", "SolidFuel"}
 
-    def is_stack_safe(name):
-        lowered = name.lower()
-        return not any(token in lowered for token in stack_unsafe_tokens)
+    def has_node(part, node_name):
+        return node_name in (part.get("nodes") or {})
+
+    def has_inline_top_bottom(part):
+        return has_node(part, "top") and has_node(part, "bottom")
+
+    def top_bottom_sizes_match(part):
+        nodes = part.get("nodes") or {}
+        if "top" not in nodes or "bottom" not in nodes:
+            return False
+        return nodes["top"]["size"] == nodes["bottom"]["size"]
+
+    def is_crewed_command(part):
+        return part.get("is_command") and int(part.get("crew_capacity", 0) or 0) > 0
+
+    def is_rocket_pod(part):
+        return (
+            is_crewed_command(part)
+            and part.get("vessel_type") != "Plane"
+            and has_inline_top_bottom(part)
+        )
+
+    def is_rocket_tank(part, resources):
+        return (
+            part["engine"] is None
+            and not part.get("is_command")
+            and part["category"] in {"FuelTank", "Propulsion"}
+            and bool(resources & tank_propellants)
+            and has_inline_top_bottom(part)
+            and top_bottom_sizes_match(part)
+        )
+
+    def is_rocket_engine(part):
+        if part["engine"] is None:
+            return False
+        propellants = set((part["engine"].get("propellants") or {}).keys())
+        return (
+            part["category"] in {"Engine", "none"}
+            and bool(propellants)
+            and propellants.issubset(supported_engine_propellants)
+            and has_inline_top_bottom(part)
+        )
 
     pods = []
     tanks = []
@@ -99,14 +139,14 @@ def load_part_lists(parts_by_name):
     for name, part in parts_by_name.items():
         resources = set((part["resources"] or {}).keys())
 
-        if not is_stack_safe(name):
+        if not part.get("stack_safe", True):
             continue
 
-        if part["category"] == "Pods" or str(part.get("_source_file", "")).startswith("Command/"):
+        if is_rocket_pod(part):
             pods.append(name)
-        elif part["engine"] is not None:
+        elif is_rocket_engine(part):
             engines.append(name)
-        elif resources & tank_propellants:
+        elif is_rocket_tank(part, resources):
             tanks.append(name)
         elif name.startswith("Decoupler_"):
             decouplers.append(name)

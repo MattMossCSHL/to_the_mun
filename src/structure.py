@@ -32,6 +32,10 @@ Intended usage:
     is_valid = validate_rocket(rocket_dict, parts_by_name, verbose=True)
 """
 
+from src.config import load_resource_lookup
+
+RESOURCE_LOOKUP = load_resource_lookup()
+
 
 # ---------------------------------------------------------------------------
 # Individual checks
@@ -345,6 +349,433 @@ def check_valid_nodes(rocket_dict: dict,
 
 
 # ---------------------------------------------------------------------------
+# Geometry helpers and filter
+# ---------------------------------------------------------------------------
+
+def build_part_lookup(rocket_dict: dict):
+    """
+    Map each placed part id to its full placed-part dict.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+
+    Returns
+    -------
+    dict
+        Mapping of placed part id to the corresponding placed-part dict.
+    """
+    part_lookup = {}
+
+    for part in rocket_dict['parts']:
+        part_id = part['id']
+        part_lookup[part_id] = part
+
+    return part_lookup
+
+
+def build_children_lookup(rocket_dict: dict):
+    """
+    Map each placed part id to the ids of its direct children.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+
+    Returns
+    -------
+    dict
+        Mapping of placed part id to a list of direct child ids.
+    """
+    children_lookup = {}
+
+    for part in rocket_dict['parts']:
+        part_id = part['id']
+        children_lookup[part_id] = []
+
+    for part in rocket_dict['parts']:
+        if part['parent'] is not None:
+            parent_id = part['parent']
+            child_id = part['id']
+
+            children_lookup[parent_id].append(child_id)
+
+    return children_lookup
+
+
+def get_root_part_id(rocket_dict: dict):
+    """
+    Return the single root part id if exactly one root exists.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+
+    Returns
+    -------
+    str or None
+        The single root part id, or None if the rocket has zero or multiple roots.
+    """
+    root_ids = []
+    for part in rocket_dict['parts']:
+        if part['parent'] is None:
+            root_ids.append(part['id'])
+
+    if len(root_ids) != 1:
+        return None
+    return root_ids[0]
+
+
+def get_inline_stack_ids(rocket_dict: dict):
+    """
+    Return the ordered top-to-bottom inline stack ids for a non-branching rocket.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+
+    Returns
+    -------
+    list[str] or None
+        Ordered part ids from root to tail for a clean inline chain, or None if
+        the rocket has no single root or branches.
+    """
+    children_lookup = build_children_lookup(rocket_dict)
+    root_id = get_root_part_id(rocket_dict)
+
+    if root_id is None:
+        return None
+
+    stack_ids = []
+    current_id = root_id
+
+    while current_id is not None:
+        stack_ids.append(current_id)
+
+        children = children_lookup[current_id]
+
+        if len(children) > 1:
+            return None
+
+        if len(children) == 0:
+            current_id = None
+        else:
+            current_id = children[0]
+
+    return stack_ids
+
+
+def get_part_height(part_info: dict):
+    """
+    Estimate part height from the vertical distance between top and bottom nodes.
+
+    Parameters
+    ----------
+    part_info : dict
+        Parts-library entry for a single part type.
+
+    Returns
+    -------
+    float or None
+        Estimated inline height, or None if either top or bottom node is missing.
+    """
+    nodes = part_info['nodes']
+
+    if 'top' not in nodes or 'bottom' not in nodes:
+        return None
+
+    top_position = nodes['top']['pos']
+    bottom_position = nodes['bottom']['pos']
+
+    top_y = top_position[1]
+    bottom_y = bottom_position[1]
+
+    return abs(top_y - bottom_y)
+
+
+def get_part_diameter_proxy(part_info: dict):
+    """
+    Estimate part diameter from bulkhead profile classes or inline node sizes.
+
+    Parameters
+    ----------
+    part_info : dict
+        Parts-library entry for a single part type.
+
+    Returns
+    -------
+    float or None
+        Approximate stack diameter proxy in meters when bulkhead profiles are
+        available, otherwise a positive inline node size proxy, or None if no
+        usable diameter signal is present.
+    """
+    profile_sizes = {
+        'size0': 0.625,
+        'size1': 1.25,
+        'size1p5': 1.875,
+        'size2': 2.5,
+        'size3': 3.75,
+    }
+
+    bulkhead_profiles = part_info['bulkhead_profiles']
+    if bulkhead_profiles is not None:
+        profile_diameters = []
+        for profile in bulkhead_profiles:
+            if profile in profile_sizes:
+                profile_diameters.append(profile_sizes[profile])
+        if len(profile_diameters) > 0:
+            return max(profile_diameters)
+
+    nodes = part_info['nodes']
+    sizes = []
+
+    if 'top' in nodes and nodes['top']['size'] > 0:
+        sizes.append(nodes['top']['size'])
+
+    if 'bottom' in nodes and nodes['bottom']['size'] > 0:
+        sizes.append(nodes['bottom']['size'])
+
+    if len(sizes) == 0:
+        return None
+
+    return max(sizes)
+
+
+def get_part_mass_proxy(part_info: dict,
+                        resource_lookup: dict):
+    """
+    Estimate wet part mass as dry mass plus stored resource mass.
+
+    Parameters
+    ----------
+    part_info : dict
+        Parts-library entry for a single part type.
+    resource_lookup : dict
+        Resource density lookup keyed by resource name.
+
+    Returns
+    -------
+    float
+        Approximate wet mass in tonnes.
+    """
+    total_mass = part_info['mass_t']
+
+    if part_info['resources'] is not None:
+        for resource_name, amount in part_info['resources'].items():
+            density = resource_lookup[resource_name]['density']
+            total_mass += amount * density
+    return total_mass
+
+
+def get_part_axial_com(part_info: dict):
+    """
+    Estimate the part center of mass along the part's own vertical axis.
+
+    Parameters
+    ----------
+    part_info : dict
+        Parts-library entry for a single part type.
+
+    Returns
+    -------
+    float or None
+        Local axial center-of-mass position, or None if the part lacks top or
+        bottom nodes needed to define its inline axis.
+    """
+    nodes = part_info['nodes']
+
+    if 'top' not in nodes or 'bottom' not in nodes:
+        return None
+
+    top_position = nodes['top']['pos']
+    bottom_position = nodes['bottom']['pos']
+
+    top_y = top_position[1]
+    bottom_y = bottom_position[1]
+
+    midpoint = (top_y + bottom_y) / 2
+
+    if part_info['com_offset'] is not None:
+        midpoint += part_info['com_offset'][1]
+
+    return midpoint
+
+
+def compute_geometry_metrics(rocket_dict: dict,
+                             parts_dict: dict,
+                             resource_lookup: dict):
+    """
+    Assemble first-pass inline geometry metrics for a rocket.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+    parts_dict : dict
+        Parts library keyed by internal part name.
+    resource_lookup : dict
+        Resource density lookup keyed by resource name.
+
+    Returns
+    -------
+    dict or None
+        Geometry metrics for a clean inline rocket, or None if the geometry
+        cannot be reconstructed from the available data.
+    """
+    part_lookup = build_part_lookup(rocket_dict)
+    stack_ids = get_inline_stack_ids(rocket_dict)
+
+    if stack_ids is None:
+        return None
+
+    part_heights = []
+    part_diameters = []
+    part_masses = []
+    part_axial_coms = []
+
+    for part_id in stack_ids:
+        placed_part = part_lookup[part_id]
+        part_type = placed_part['type']
+        part_info = parts_dict[part_type]
+
+        height = get_part_height(part_info)
+        diameter = get_part_diameter_proxy(part_info)
+        mass = get_part_mass_proxy(part_info, resource_lookup)
+        axial_com = get_part_axial_com(part_info)
+
+        if height is None or diameter is None or axial_com is None:
+            return None
+
+        part_heights.append(height)
+        part_diameters.append(diameter)
+        part_masses.append(mass)
+        part_axial_coms.append(axial_com)
+
+    total_height = sum(part_heights)
+
+    if total_height <= 0:
+        return None
+
+    diameter_transitions = []
+
+    for item in range(len(part_diameters) - 1):
+        current_diameter = part_diameters[item]
+        next_diameter = part_diameters[item + 1]
+
+        if current_diameter != next_diameter:
+            transition_size = abs(next_diameter - current_diameter)
+            diameter_transitions.append(transition_size)
+
+    diameter_transition_count = len(diameter_transitions)
+    diameter_transition_severity = sum(diameter_transitions)
+
+    max_diameter = max(part_diameters)
+    if max_diameter <= 0:
+        return None
+
+    slenderness_ratio = total_height / max_diameter
+
+    global_part_coms = []
+    current_top = 0
+
+    for i in range(len(stack_ids)):
+        part_height = part_heights[i]
+        part_local_com = part_axial_coms[i]
+
+        local_top_y = part_height / 2
+        global_part_com = current_top + (local_top_y - part_local_com)
+
+        global_part_coms.append(global_part_com)
+        current_top += part_height
+
+    total_mass = sum(part_masses)
+    if total_mass <= 0:
+        return None
+
+    axial_center_of_mass = sum(
+        part_mass * global_com for part_mass, global_com in zip(part_masses, global_part_coms)
+    ) / total_mass
+
+    center_of_mass_height_fraction = axial_center_of_mass / total_height
+
+    return {
+      "stack_ids": stack_ids,
+      "part_heights": part_heights,
+      "part_diameters": part_diameters,
+      "part_masses": part_masses,
+      "part_axial_coms": part_axial_coms,
+      "total_height": total_height,
+      "diameter_transitions": diameter_transitions,
+      "diameter_transition_count": diameter_transition_count,
+      "diameter_transition_severity": diameter_transition_severity,
+      "axial_center_of_mass": axial_center_of_mass,
+      "center_of_mass_height_fraction": center_of_mass_height_fraction,
+      "slenderness_ratio": slenderness_ratio
+    }
+
+
+def check_geometry_filter(rocket_dict: dict,
+                          parts_dict: dict,
+                          resource_lookup: dict,
+                          verbose: bool = False):
+    """
+    Apply the first-pass inline geometry filter to a rocket.
+
+    Parameters
+    ----------
+    rocket_dict : dict
+        Rocket design dict with a 'parts' list.
+    parts_dict : dict
+        Parts library keyed by internal part name.
+    resource_lookup : dict
+        Resource density lookup keyed by resource name.
+    verbose : bool, optional
+        If True, print the geometry metrics and any failed soft rules.
+
+    Returns
+    -------
+    bool
+        False on geometry reconstruction failure, or when two or more soft
+        geometry rules fail. True otherwise.
+    """
+    metrics = compute_geometry_metrics(rocket_dict, parts_dict, resource_lookup)
+
+    if metrics is None:
+        if verbose:
+            print("FAIL: could not reconstruct inline geometry")
+        return False
+
+    failed_rules = []
+
+    if metrics["diameter_transition_count"] > 2:
+        failed_rules.append("too many diameter transitions")
+
+    if metrics["diameter_transition_severity"] > 2.5:
+        failed_rules.append("severe diameter transitions")
+
+    if metrics["slenderness_ratio"] > 9.0:
+        failed_rules.append("extreme slenderness")
+
+    if metrics["center_of_mass_height_fraction"] < 0.2:
+        failed_rules.append("top-heavy mass distribution")
+
+    if verbose:
+        print("geometry metrics:", metrics)
+        print("failed geometry rules:", failed_rules)
+
+    if len(failed_rules) >= 2:
+        if verbose:
+            print("FAIL: geometry filter")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Final validator
 # ---------------------------------------------------------------------------
 
@@ -385,6 +816,16 @@ def validate_rocket(rocket_dict: dict,
             if verbose:
                 print(f"FAIL: unknown part type '{part['type']}'")
             return False
+    geometry_check = check_geometry_filter(
+        rocket_dict,
+        parts_dict,
+        RESOURCE_LOOKUP,
+        verbose=verbose
+    )
+    if not geometry_check:
+        if verbose:
+            print('Failed geometry check')
+        return False
     checks = [
           (has_minimal_structure(rocket_dict, parts_dict),  "missing root, command, or engine"),
           (check_graph_connections(rocket_dict, parts_dict), "part tree disconnected or has cycles"),
